@@ -1,6 +1,7 @@
 """
 奇异点检测和处理模块
-处理Panda机械臂的奇异点问题
+处理Panda机械臂的奇异点问题：基于雅可比条件数/最小奇异值检测，
+检测到奇异时给出渐进安全配置并检查恢复；后续可迁移到 MOVEIT 的自检测。
 """
 
 import numpy as np
@@ -212,10 +213,14 @@ class SingularityHandler:
         """
         return self.get_progressive_safe_action(current_config, step_size=0.05)
     
-    def generate_safe_initial_config(self) -> np.ndarray:
+    def generate_safe_initial_config(self, rng=None) -> np.ndarray:
         """
         生成安全的初始配置
-        
+
+        Args:
+            rng: 可选的随机数生成器（如 gymnasium 的 self.np_random）。
+                传入后初始位形由外部 seed 完全决定、可复现；None 时回退到全局 np.random。
+
         Returns:
             safe_config: 安全的初始配置
         """
@@ -230,8 +235,10 @@ class SingularityHandler:
             (-0.5, 0.5),     # joint7: 更保守的范围
         ]
         
+        if rng is None:
+            rng = np.random
         config = np.array([
-            np.random.uniform(low, high) for low, high in safe_ranges
+            rng.uniform(low, high) for low, high in safe_ranges
         ])
         
         # 验证配置安全性
@@ -241,28 +248,7 @@ class SingularityHandler:
             config = self.safe_config.copy()
         
         return config
-    
-    def add_singularity_penalty(self, reward: float, joint_positions: np.ndarray) -> float:
-        """
-        添加奇异点惩罚
-        
-        Args:
-            reward: 原始奖励
-            joint_positions: 关节位置
-            
-        Returns:
-            modified_reward: 修改后的奖励
-        """
-        is_singular, singularity_type, score = self.detect_singularity(joint_positions)
-        
-        if is_singular:
-            # 大幅减少奇异点惩罚，避免过度干扰学习
-            penalty = -1.0 * score  # 最大惩罚-1（原来是-10）
-            self.logger.warning(f"检测到奇异点: {singularity_type}, 程度: {score:.3f}, 惩罚: {penalty:.3f}")
-            return reward + penalty
-        
-        return reward
-    
+
     def check_singularity_recovery(self, joint_positions: np.ndarray, 
                                  previous_positions: np.ndarray) -> bool:
         """

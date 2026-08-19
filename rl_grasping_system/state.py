@@ -88,20 +88,37 @@ def get_proprioceptive_state(data: mujoco.MjData, model: mujoco.MjModel, env) ->
     joint_velocities = data.qvel[:7].copy()
     joint_torques = data.qfrc_actuator[:7].copy()
     
-    # 肌腱状态
-    tendon_position = data.qpos[7] if len(data.qpos) > 7 else 0.0
-    tendon_velocity = data.qvel[7] if len(data.qvel) > 7 else 0.0
+    # 肌腱状态：由 finger 关节位置计算（tendon "split" = 0.5*(q1+q2)，equality 约束下 q1==q2）
+    # P1 修复：目标物体含 freejoint，qpos/qvel 地址 ≠ 关节ID，必须用 jnt_qposadr/jnt_dofadr 索引
+    gripper_joint_ids = getattr(env, 'gripper_joint_ids', [])
+    if gripper_joint_ids:
+        fid = gripper_joint_ids[0]
+        qpos_adr = model.jnt_qposadr[fid] if fid < model.njnt else fid
+        dof_adr = model.jnt_dofadr[fid] if fid < model.njnt else fid
+        tendon_position = float(data.qpos[qpos_adr]) if qpos_adr < len(data.qpos) else 0.0
+        tendon_velocity = float(data.qvel[dof_adr]) if dof_adr < len(data.qvel) else 0.0
+    else:
+        tendon_position = 0.0
+        tendon_velocity = 0.0
     
     # 计算肌腱张力（基于位置）
     tendon_tension = calculate_tendon_tension(tendon_position)
     
-    # 末端状态 - 使用hand body的位置
+    # 末端状态 - 使用hand body的真实位姿/速度
+    # P1 修复：此前硬编码默认四元数[1,0,0,0]和零速度，导致方向奖励恒为常量、观测无信息
     end_effector_pos = get_end_effector_position(data, model)
-    end_effector_orientation = np.array([1, 0, 0, 0])  # 默认四元数
-    end_effector_velocity = np.zeros(6)  # 简化的末端速度
-    
-    # 夹爪状态
-    gripper_state = data.qpos[8] if len(data.qpos) > 8 else 0.0
+    hand_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "hand")
+    if hand_id >= 0 and hand_id < len(data.xquat):
+        end_effector_orientation = data.xquat[hand_id].copy()
+    else:
+        end_effector_orientation = np.array([1, 0, 0, 0])
+    if hand_id >= 0 and hand_id < len(data.cvel):
+        end_effector_velocity = data.cvel[hand_id].copy()  # [旋转(3), 平移(3)]
+    else:
+        end_effector_velocity = np.zeros(6)
+
+    # 夹爪状态（=肌腱长度，0=闭合, 0.04=全开）
+    gripper_state = tendon_position
     
     # 目标信息
     target_position = env.target_pos if hasattr(env, 'target_pos') else np.array([0.5, 0.0, 0.3])
@@ -221,48 +238,3 @@ def calculate_manipulability(joint_positions: np.ndarray) -> float:
     manipulability = 1.0 / (1.0 + np.exp(-10 * (min_singularity_distance - 0.3)))
     
     return manipulability
-
-def tendon_dynamics(cmd: float, current_pos: float, tension: float, dt: float = 0.01) -> tuple:
-    """
-    肌腱动力学模型 - 改进版本，增加响应性
-    
-    Args:
-        cmd: 控制命令 (0-1)
-        current_pos: 当前肌腱位置
-        tension: 当前张力
-        dt: 时间步长
-        
-    Returns:
-        new_pos: 新的肌腱位置
-        new_tension: 新的张力
-    """
-    # 肌腱动力学参数 - 调整以提高响应性
-    max_speed = 0.5  # m/s (增加速度)
-    rest_length = 0.02  # m
-    max_length = 0.04   # m
-    min_length = 0.01   # m
-    
-    # 计算目标位置 (基于命令)
-    target_pos = min_length + cmd * (max_length - min_length)
-    
-    # 增强的PD控制器
-    kp = 50.0  # 比例增益 (增加)
-    kd = 5.0   # 微分增益 (增加)
-    
-    # 计算速度
-    pos_error = target_pos - current_pos
-    speed = kp * pos_error
-    
-    # 限制速度
-    speed = np.clip(speed, -max_speed, max_speed)
-    
-    # 更新位置
-    new_pos = current_pos + speed * dt
-    
-    # 限制位置范围
-    new_pos = np.clip(new_pos, min_length, max_length)
-    
-    # 使用改进的张力计算
-    new_tension = calculate_tendon_tension(new_pos)
-    
-    return new_pos, new_tension

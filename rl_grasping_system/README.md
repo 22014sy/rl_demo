@@ -85,30 +85,36 @@ python evaluate.py --model_path models/final_model.zip
 ### 训练配置
 ```python
 # 基本参数
-total_timesteps: int = 2000000  # 总训练步数
+total_timesteps: int = 50000  # 总训练步数
 learning_rate: float = 3e-4     # 学习率
 batch_size: int = 1024          # 批次大小
 n_steps: int = 1024             # 每轮步数
 
 # 归一化参数
 normalize_observations: bool = True  # 观察归一化
-normalize_rewards: bool = True       # 奖励归一化
+normalize_rewards: bool = False      # P1: 关闭奖励归一化（奖励已由 P1.3 势能塑形有界化）
 norm_obs_clip: float = 10.0         # 观察裁剪
 norm_reward_clip: float = 10.0      # 奖励裁剪
 ```
 
-### 奖励配置
+### 奖励配置（P1.3 势能塑形，见 reward.py）
 ```python
-# 距离奖励
-distance_reward_scale: float = 0.1  # 距离奖励系数
-distance_threshold: float = 0.2     # 距离阈值
+# 位置目标 = 物体中心正上方（pre-grasp 位姿，hand 基座物理可达）
+pre_grasp_offset_z: float = 0.10   # hand 基座悬停高度
 
-# 抓取奖励
-grasp_reward: float = 500.0         # 抓取成功奖励
-grasp_distance_threshold: float = 0.1  # 抓取距离阈值
+# 距离/方向势能（低=好）；单步奖励 = Φ(s_prev) − γ·Φ(s)，γ=shaping_gamma
+w_xy: float = 2.0                  # 平面距离权重
+w_height: float = 2.0              # 高度权重
+xy_scale: float = 0.3              # 平面距离归一化尺度(m)
+height_scale: float = 0.15         # 高度归一化尺度(m)
+w_orient: float = 2.0              # 手指朝下(目标抓取姿态)对齐权重
+shaping_gamma: float = 0.99        # 势能塑形折扣
 
-# 完成奖励
-completion_reward: float = 1000.0   # 任务完成奖励
+# 事件奖励（一次性/每步，量级与典型单步奖励相当）
+w_contact: float = 1.0             # 手指接触物体
+grasp_reward: float = 5.0          # is_grasped（到位+夹紧+接触）
+completion_reward: float = 10.0    # grasp_success
+step_penalty: float = 0.01         # 时间惩罚
 ```
 
 ## 归一化技术
@@ -172,7 +178,7 @@ value_hidden_sizes: [512, 512, 256]
 
 ### 训练参数
 - **学习率**: 3e-4 (适中)
-- **熵系数**: 0.2 (促进探索)
+- **熵系数**: 0.01 (促进探索)
 - **GAE lambda**: 0.95 (优势估计)
 - **裁剪范围**: 0.2 (PPO裁剪)
 
@@ -213,6 +219,71 @@ Cannot initialize a EGL device display
 - **归一化**: 观察/奖励归一化 + PPO内置优势函数归一化
 - **云端优化**: 无头渲染、CPU训练、错误处理
 - **监控增强**: 实时图表、早停机制、详细日志
+
+
+### 笔记
+
+奖励曲线
+含义：每个 episode 的总奖励是多少
+作用：最核心的“学习效果”指标
+你应该看：
+如果它一直上升，说明策略在变好
+如果它震荡很大，说明训练不稳定
+如果它长期不升，说明奖励设计或环境可能有问题
+
+成功率曲线
+含义：最近 10 个 episode 中，有多少比例成功完成抓取
+作用：比奖励更直接，反映“任务是否真的学会了”
+
+奇异点统计
+含义：机械臂发生奇异点的次数
+作用：反映机械臂是否“走到了不健康的姿态”
+你应该看：
+奇异点越少越好
+如果它突然变多，说明策略开始走偏，可能把机械臂推到危险姿态
+
+Episode 长度
+含义：每个 episode 结束前用了多少步
+作用：反映任务是否越来越高效
+如果长度越来越短，说明机器人越来越快完成任务
+如果长度越来越长，说明它可能在原地打转，或者没有学会高效策略
+
+如果奖励在涨，但成功率不涨
+说明：你的奖励函数可能“骗过”智能体，它学会了拿到高 reward，但没有真正学会抓取
+你可以考虑：
+调整奖励函数，让成功抓取的奖励更明显
+减少“只靠靠近物体就能拿高分”的奖励设计
+
+如果成功率低，且奇异点多
+说明：策略在尝试危险动作，机械臂可能学到了一些不稳定的控制方式
+你可以考虑：
+增加安全约束
+降低动作幅度
+调整奖励，惩罚危险姿态
+
+如果奖励和成功率都很波动
+说明：训练不稳定，可能是学习率、批次大小、熵系数或归一化设置不合适
+你可以考虑：
+降低学习率
+调整 PPO 的 ent_coef
+增加训练稳定性
+
+如果 episode 长度越来越长
+说明：智能体可能没有学会快速完成任务，或者环境终止条件不够利于它学习
+你可以考虑：
+缩短最大步数
+调整任务目标，让它更容易学到“快速完成”
+
+最实用的判断标准
+你可以把它们看成三个层次：
+奖励曲线：看“有没有学到东西”
+成功率：看“有没有真正完成任务”
+奇异点/episode 长度：看“是不是学得很不稳或很低效”
+
+
+成功率有没有从低往上走
+奇异点有没有明显增多
+奖励曲线是否持续上升而不是只偶尔冲高
 
 ## 文件结构
 

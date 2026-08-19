@@ -23,9 +23,19 @@
     <light pos="0 0 1.5" dir="0 0 -1" directional="true"/>
     <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"/>
     
-    <!-- 单一目标物体 -->
+    <!-- 单一目标物体
+         P0-1 修复记录：
+           1) 新增 <freejoint/>：原模型 target_cube 是静态物体（无关节，焊接在世界上），
+              夹爪永远无法把它抓起/抬升，这是“成功率恒为 0”的根因之一。
+              加入 freejoint 后物体可自由运动，能被夹爪带动抬升。
+           2) 尺寸 0.05(边长0.1m) -> 0.02(边长0.04m)：夹爪指尖内表面最大开口实测约
+              0.056m，原 0.1m 物体根本放不进夹爪；0.04m 留有足够抓取余量。
+           3) 显式给定质量/惯性，保证动力学确定性。
+    -->
     <body name="target_cube" pos="0.5 0.0 0.1">
-      <geom type="box" size="0.05 0.05 0.05" material="target_material"/>
+      <freejoint/>
+      <inertial pos="0 0 0" mass="0.064" diaginertia="1.7067e-5 1.7067e-5 1.7067e-5"/>
+      <geom type="box" name="target_cube_geom" size="0.02 0.02 0.02" material="target_material"/>
     </body>
     
     <!-- 相机配置 -->

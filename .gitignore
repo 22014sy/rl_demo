@@ -155,3 +155,8 @@ tmp/
 config_local.py
 secrets.py
 .env.local
+
+# Colcon / ROS2 构建产物
+install/
+log/
+ros2_ws/

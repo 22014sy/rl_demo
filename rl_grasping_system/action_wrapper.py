@@ -15,7 +15,8 @@ class SafeActionWrapper:
         self.logger = logging.getLogger(__name__)
         
         # 安全参数
-        self.max_joint_velocity = 0.5  # 最大关节速度 (rad/s)
+        # P1: 动作前7维为每步关节增量(rad)，增量式位置控制；上限来自配置
+        self.max_joint_delta = float(getattr(env.grasping_config, 'max_joint_delta', 0.05))
         self.singularity_threshold = 0.1  # 提高可操作度阈值，减少误报
         self.slowdown_factor = 0.3  # 奇异点附近降速因子
         self.max_tension = 100.0  # 最大允许张力(N)
@@ -42,87 +43,48 @@ class SafeActionWrapper:
     
     def apply(self, raw_action: np.ndarray, current_state: Dict[str, Any]) -> Dict[str, np.ndarray]:
         """
-        应用安全约束到原始动作
-        
-        Args:
-            raw_action: 原始动作 [8,] 或字典格式
-            current_state: 当前状态信息
-            
-        Returns:
-            safe_action: 安全动作字典
+        将原始动作转换为安全的目标关节位置（增量式位置控制）
+
+        P1 重构：前7维 = 每步关节增量(rad)，第8维 = 肌腱命令(0=闭合,1=张开)。
+        执行器是位置伺服（ctrl=目标位置），因此输出 = 当前 qpos + 增量，
+        而不是旧版错误的“当前速度±0.005 当作位置目标”（导致手臂几乎不可控）。
         """
-        # 处理输入格式
+        # 解析动作
         if isinstance(raw_action, np.ndarray):
-            # 转换为字典格式
-            action_dict = {
-                'joint_commands': raw_action[:7],
-                'tendon_command': raw_action[7] if len(raw_action) > 7 else 0.0,
-                'gripper_command': raw_action[7] if len(raw_action) > 7 else 0.0
-            }
+            joint_deltas = np.asarray(raw_action[:7], dtype=np.float64)
+            tendon_command = float(raw_action[7]) if len(raw_action) > 7 else 0.0
         else:
             action_dict = raw_action.copy()
-        
-        # 1. 奇异点检测和处理（与SingularityHandler协调）
-        current_joint_pos = current_state.get('joint_positions', np.zeros(7))
+            joint_deltas = np.asarray(action_dict.get('joint_commands', np.zeros(7)), dtype=np.float64)
+            tendon_command = float(action_dict.get('tendon_command', 0.0))
+
+        current_joint_pos = np.asarray(current_state.get('joint_positions', np.zeros(7)), dtype=np.float64)
+
+        # 1. 关节增量限幅（保证增量式位置控制稳定）
+        joint_deltas = np.clip(joint_deltas, -self.max_joint_delta, self.max_joint_delta)
+
+        # 2. 奇异点降速（在增量上缩放，与 SingularityHandler 协调）
         if hasattr(self.env, 'singularity_handler'):
-            # 使用奇异点处理器的检测结果
             is_singular, singularity_type, singularity_score = self.env.singularity_handler.detect_singularity(current_joint_pos)
-            
             if is_singular:
-                # 根据奇异点类型选择降速因子
                 slowdown_factor = self._get_singularity_slowdown_factor(singularity_type, singularity_score)
-                action_dict['joint_commands'] *= slowdown_factor
-                
-                # 记录奇异点处理（仅在调试模式下）
+                joint_deltas *= slowdown_factor
                 if self.logger.isEnabledFor(logging.DEBUG):
                     self.logger.debug(f"奇异点处理: 类型={singularity_type}, 程度={singularity_score:.3f}, 降速因子={slowdown_factor:.2f}")
-        else:
-            # 备用方案：使用可操作度
-            manipulability = current_state.get('manipulability', 1.0)
-            if manipulability < self.singularity_threshold:
-                action_dict['joint_commands'] *= self.slowdown_factor
-                if self.logger.isEnabledFor(logging.DEBUG):
-                    self.logger.debug(f"可操作度降速: 可操作度={manipulability:.3f}")
-        
-        # 2. 肌腱张力保护
-        tendon_tension = current_state.get('tendon_tension', 0.0)
-        if tendon_tension > self.max_tension * 0.8:
-            # 张力过高时只允许放松
-            action_dict['tendon_command'] = min(action_dict['tendon_command'], 0)
-            if self.logger.isEnabledFor(logging.DEBUG):
-                self.logger.debug(f"肌腱张力保护: 张力={tendon_tension:.2f}N")
-        
-        # 3. 关节速度限制
-        current_joint_vel = current_state.get('joint_velocities', np.zeros(7))
-        joint_commands = action_dict['joint_commands']
-        
-        # 限制关节速度变化
-        max_velocity_change = self.max_joint_velocity * 0.01  # 每步最大速度变化
-        velocity_change = joint_commands - current_joint_vel
-        velocity_change = np.clip(velocity_change, -max_velocity_change, max_velocity_change)
-        action_dict['joint_commands'] = current_joint_vel + velocity_change
-        
-        # 4. 关节位置限制
-        current_joint_pos = current_state.get('joint_positions', np.zeros(7))
+
+        # 3. 目标关节位置 = 当前 + 增量，裁剪到关节限位
+        target_positions = current_joint_pos + joint_deltas
         for i, (joint_name, (low, high)) in enumerate(self.joint_limits.items()):
-            # 确保动作不会导致超出关节限制
-            predicted_pos = current_joint_pos[i] + action_dict['joint_commands'][i] * 0.01
-            if predicted_pos < low or predicted_pos > high:
-                # 调整动作以避免超出限制
-                max_action = (high - current_joint_pos[i]) / 0.01
-                min_action = (low - current_joint_pos[i]) / 0.01
-                action_dict['joint_commands'][i] = np.clip(action_dict['joint_commands'][i], min_action, max_action)
-                
-                if self.logger.isEnabledFor(logging.DEBUG):
-                    self.logger.debug(f"关节限制保护: {joint_name}, 预测位置={predicted_pos:.3f}, 限制=[{low:.3f}, {high:.3f}]")
-        
-        # 5. 夹爪控制限制
-        action_dict['gripper_command'] = np.clip(action_dict['gripper_command'], 0.0, 0.04)
-        
-        # 6. 肌腱控制限制
-        action_dict['tendon_command'] = np.clip(action_dict['tendon_command'], 0.0, 1.0)
-        
-        return action_dict
+            target_positions[i] = np.clip(target_positions[i], low, high)
+
+        # 4. 肌腱命令限幅 [0,1]（0=闭合, 1=张开）
+        tendon_command = float(np.clip(tendon_command, 0.0, 1.0))
+
+        return {
+            'joint_commands': target_positions,   # ctrl[:7] = 目标位置
+            'tendon_command': tendon_command,     # ctrl[7] = int(cmd*255)，0=闭合
+            'gripper_command': tendon_command
+        }
     
     def _get_singularity_slowdown_factor(self, singularity_type: str, singularity_score: float) -> float:
         """
@@ -149,39 +111,10 @@ class SafeActionWrapper:
         return base_factor
     
     def get_safe_initial_action(self) -> Dict[str, np.ndarray]:
-        """获取安全的初始动作"""
+        """获取安全的初始动作（零增量=保持当前位形，肌腱半开）"""
         return {
             'joint_commands': np.zeros(7, dtype=np.float32),
-            'tendon_command': 0.0,
-            'gripper_command': 0.02  # 半开状态
+            'tendon_command': 0.5,
+            'gripper_command': 0.5
         }
-    
-    def tendon_dynamics(self, cmd: float, current_pos: float, tension: float, dt: float = 0.01) -> tuple:
-        """
-        肌腱动力学模型
-        
-        Args:
-            cmd: 控制命令 (0-1)
-            current_pos: 当前肌腱位置
-            tension: 当前张力
-            dt: 时间步长
-            
-        Returns:
-            new_pos: 新的肌腱位置
-            new_tension: 新的张力
-        """
-        # 肌腱动力学参数
-        max_speed = 0.5  # m/s
-        spring_constant = 500.0  # N/m
-        rest_length = 0.02  # m
-        
-        # 限制速度
-        speed = np.clip(cmd, -max_speed, max_speed)
-        
-        # 更新位置
-        new_pos = current_pos + speed * dt
-        
-        # 计算张力 (F = k * Δx)
-        new_tension = spring_constant * (new_pos - rest_length)
-        
-        return new_pos, new_tension
+

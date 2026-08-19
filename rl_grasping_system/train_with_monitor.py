@@ -6,10 +6,16 @@
 import os
 import sys
 import logging
+
+# 本地桌面渲染后端默认 GLFW（云端请用 train_cloud.py，其内部设 EGL）。
+# P0-2: 环境不再内部写死 MUJOCO_GL，避免覆盖云端设置。
+os.environ.setdefault('MUJOCO_GL', 'glfw')
+
 from agent import GraspingAgent
 from environment import PandaGraspingEnv
 from config import get_config
 from training_monitor import TrainingMonitor
+
 
 def setup_logging():
     """设置日志"""
@@ -44,6 +50,7 @@ def main():
             reward_config=config.reward
         )
         logger.info("环境创建成功")
+      
         
         # 创建智能体
         logger.info("创建智能体...")

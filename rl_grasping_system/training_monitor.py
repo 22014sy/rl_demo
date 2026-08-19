@@ -15,6 +15,18 @@ import logging
 plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans', 'Arial Unicode MS', 'sans-serif']
 plt.rcParams['axes.unicode_minus'] = False
 
+
+def _json_default(o):
+    """json.dump 的 numpy 类型转换（P1 修复：np.bool_/np.float64 等不可直接序列化，
+    若不做转换 json.dump 会在写完一半时抛异常，把日志文件截断成非法 JSON）"""
+    if isinstance(o, np.bool_):
+        return bool(o)
+    if isinstance(o, np.integer):
+        return int(o)
+    if isinstance(o, np.floating):
+        return float(o)
+    return str(o)
+
 class TrainingMonitor:
     """训练监控器"""
     
@@ -47,8 +59,10 @@ class TrainingMonitor:
     
     def _init_log(self):
         """初始化日志文件"""
+        self._start_time = datetime.now().isoformat()
+        self._logged_episodes = []  # P1: 内存持有全部 episode 记录，避免每次读回文件
         log_data = {
-            "start_time": datetime.now().isoformat(),
+            "start_time": self._start_time,
             "episodes": [],
             "summary": {}
         }
@@ -156,13 +170,9 @@ class TrainingMonitor:
     
     def _save_to_log(self, episode: int, reward: float, length: int, 
                     success: bool, singularity_count: int, episode_time: float, stats: Dict):
-        """保存到日志文件"""
+        """保存到日志文件（P1 修复：不再读回文件，直接以内存数据整体写盘，避免读到写一半的文件）"""
         try:
-            with open(self.log_file, 'r') as f:
-                log_data = json.load(f)
-            
-            # 添加episode数据
-            episode_data = {
+            self._logged_episodes.append({
                 "episode": episode,
                 "reward": reward,
                 "length": length,
@@ -170,16 +180,16 @@ class TrainingMonitor:
                 "singularity_count": singularity_count,
                 "episode_time": episode_time,
                 "timestamp": datetime.now().isoformat()
+            })
+
+            log_data = {
+                "start_time": self._start_time,
+                "episodes": self._logged_episodes,
+                "summary": stats
             }
-            log_data["episodes"].append(episode_data)
-            
-            # 更新统计信息
-            log_data["summary"] = stats
-            
-            # 保存
-            with open(self.log_file, 'w') as f:
-                json.dump(log_data, f, indent=2)
-                
+            with open(self.log_file, 'w', encoding='utf-8') as f:
+                json.dump(log_data, f, indent=2, ensure_ascii=False, default=_json_default)
+
         except Exception as e:
             self.logger.warning(f"保存日志失败: {e}")
     

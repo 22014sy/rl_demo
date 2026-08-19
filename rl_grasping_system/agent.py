@@ -9,13 +9,14 @@ import numpy as np
 from typing import Dict, Tuple, Optional, Union
 import logging
 import os
+from stable_baselines3.common.monitor import Monitor
 
 # 尝试导入stable-baselines3
 try:
     from stable_baselines3 import PPO
     from stable_baselines3.common.policies import ActorCriticPolicy
     from stable_baselines3.common.vec_env import DummyVecEnv
-    from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback, EvalCallback
+    from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
     SB3_AVAILABLE = True
     logger = logging.getLogger(__name__)
     logger.info("✅ Stable-Baselines3 可用")
@@ -46,27 +47,22 @@ class GraspingCallback(BaseCallback):
         self.should_stop = False
         
     def _on_step(self) -> bool:
-        """每步调用"""
+        """每步调用（P1 修复：从 info 读取 grasp_success，而不是访问 Monitor 上不存在的 env.task_state）"""
         # 如果应该停止，返回False
         if self.should_stop:
             return False
-            
-        # 获取环境信息
-        if hasattr(self.training_env, 'envs'):
-            env = self.training_env.envs[0]
-        else:
-            env = self.training_env
-            
-        # 检查是否完成episode
-        if hasattr(env, 'task_state') and env.task_state['grasp_success']:
-            self.success_count += 1
-            self.total_episodes += 1
-            
-            # 记录episode信息
-            if hasattr(env, 'task_state'):
-                self.episode_rewards.append(env.task_state.get('episode_reward', 0))
-                self.episode_lengths.append(env.task_state.get('episode_steps', 0))
-        
+
+        infos = self.locals.get('infos', [])
+        for info in infos:
+            # 终端步若 grasp_success=True，记一次成功
+            if info.get('grasp_success', False):
+                self.success_count += 1
+            # SB3 Monitor 在每个 episode 结束时写入 info['episode']，用于统计 episode 数
+            if info.get('episode') is not None:
+                self.total_episodes += 1
+                self.episode_rewards.append(info['episode'].get('r', 0.0))
+                self.episode_lengths.append(info['episode'].get('l', 0))
+
         return True
     
     def _on_rollout_end(self) -> None:
@@ -143,7 +139,8 @@ class GraspingAgent:
         Args:
             env: Gymnasium环境
         """
-        # 设置环境
+        # 设置环境：Monitor 包装真实环境，在 info 中输出 episode 统计
+        env = Monitor(env)
         self.env = env
         
         # 创建训练监控器
@@ -151,12 +148,14 @@ class GraspingAgent:
         self.training_monitor = TrainingMonitor(
             log_dir=logs_dir, 
             save_plots=True,
-            plot_save_freq=2000  # 每500个episodes保存一次图表（降低频率）
+            plot_save_freq=2000  # 每2000个episodes保存一次图表
         )
         
-        # 将监控器传递给环境
-        if hasattr(self.env, 'training_monitor'):
-            self.env.training_monitor = self.training_monitor
+        # P1 修复：把监控器挂到真实环境（PandaGraspingEnv）上。
+        # 旧代码 `hasattr(self.env, 'training_monitor')` 检查的是 Monitor 包装层，
+        # 永远为 False，导致 training_monitor 从未被挂载，JSON 里 episodes 一直为空。
+        real_env = env.env if hasattr(env, 'env') else env
+        real_env.training_monitor = self.training_monitor
         
         # 创建归一化向量化环境
         from vec_normalize_wrapper import create_normalized_env
@@ -247,16 +246,7 @@ class GraspingAgent:
         # 开始训练
         logger.info(f"开始训练，总步数: {total_timesteps}")
         
-        # 设置episode编号跟踪
-        episode_counter = 0
-        
-        def episode_callback(locals, globals):
-            nonlocal episode_counter
-            episode_counter += 1
-            if hasattr(self.env, 'training_monitor') and self.env.training_monitor:
-                self.env.task_state['episode_number'] = episode_counter
-        
-        # 训练
+        # 训练（P1：移除未注册的死代码 episode_callback；episode 记录由真实环境自行完成）
         self.agent.learn(
             total_timesteps=total_timesteps,
             callback=callbacks,
