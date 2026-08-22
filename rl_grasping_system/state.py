@@ -83,31 +83,32 @@ def get_proprioceptive_state(data: mujoco.MjData, model: mujoco.MjModel, env) ->
     Returns:
         state: 本体感知状态字典
     """
-    # 本体状态
-    joint_positions = data.qpos[:7].copy()
-    joint_velocities = data.qvel[:7].copy()
-    joint_torques = data.qfrc_actuator[:7].copy()
-    
-    # 肌腱状态：由 finger 关节位置计算（tendon "split" = 0.5*(q1+q2)，equality 约束下 q1==q2）
-    # P1 修复：目标物体含 freejoint，qpos/qvel 地址 ≠ 关节ID，必须用 jnt_qposadr/jnt_dofadr 索引
-    gripper_joint_ids = getattr(env, 'gripper_joint_ids', [])
-    if gripper_joint_ids:
-        fid = gripper_joint_ids[0]
-        qpos_adr = model.jnt_qposadr[fid] if fid < model.njnt else fid
-        dof_adr = model.jnt_dofadr[fid] if fid < model.njnt else fid
-        tendon_position = float(data.qpos[qpos_adr]) if qpos_adr < len(data.qpos) else 0.0
-        tendon_velocity = float(data.qvel[dof_adr]) if dof_adr < len(data.qvel) else 0.0
+    # 本体状态（Task3：只取机械臂 6 关节；freejoint 存在时 qpos 地址≠关节ID，必须用 arm_joint_ids）
+    arm_joint_ids = list(getattr(env, 'arm_joint_ids', [])) or list(range(6))
+    joint_positions = data.qpos[arm_joint_ids].copy()
+    joint_velocities = data.qvel[arm_joint_ids].copy()
+    joint_torques = data.qfrc_actuator[arm_joint_ids].copy()
+
+    # 夹爪状态（Task3：2F-85 开口宽度 = 两衬垫 site 距离，由环境测量）。
+    # tendon_position/velocity/tension 保留原维度语义：
+    #   tendon_position = 开度 width(m)；tendon_velocity 无跨步差分，置 0；
+    #   tendon_tension = 由归一化闭合量导出的握持张力（越闭合越大，0~100）
+    if hasattr(env, '_get_gripper_width'):
+        tendon_position = float(env._get_gripper_width())
     else:
         tendon_position = 0.0
-        tendon_velocity = 0.0
+    tendon_velocity = 0.0
+    _cfg = getattr(env, 'grasping_config', None)
+    _w_min = float(getattr(_cfg, 'grasp_min_width', 0.02))
+    _w_max = float(getattr(_cfg, 'gripper_max_width', 0.093))
+    _closure = float(np.clip((_w_max - tendon_position) / max(_w_max - _w_min, 1e-6), 0.0, 1.0))
+    tendon_tension = _closure * 100.0
     
-    # 计算肌腱张力（基于位置）
-    tendon_tension = calculate_tendon_tension(tendon_position)
-    
-    # 末端状态 - 使用hand body的真实位姿/速度
-    # P1 修复：此前硬编码默认四元数[1,0,0,0]和零速度，导致方向奖励恒为常量、观测无信息
-    end_effector_pos = get_end_effector_position(data, model)
-    hand_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "hand")
+    # 末端状态 - 使用末端 body（Task3：rq_base_mount；Panda 兼容 'hand'）的真实位姿/速度
+    end_effector_pos = get_end_effector_position(data, model, env)
+    hand_id = int(getattr(env, 'end_effector_id', -1))
+    if hand_id < 0:
+        hand_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "hand")
     if hand_id >= 0 and hand_id < len(data.xquat):
         end_effector_orientation = data.xquat[hand_id].copy()
     else:
@@ -117,8 +118,8 @@ def get_proprioceptive_state(data: mujoco.MjData, model: mujoco.MjModel, env) ->
     else:
         end_effector_velocity = np.zeros(6)
 
-    # 夹爪状态（=肌腱长度，0=闭合, 0.04=全开）
-    gripper_state = tendon_position
+    # 夹爪状态（归一化开度 width/max_width，0=闭合, 1=全开）
+    gripper_state = float(tendon_position) / _w_max if _w_max > 0 else 0.0
     
     # 目标信息
     target_position = env.target_pos if hasattr(env, 'target_pos') else np.array([0.5, 0.0, 0.3])
@@ -165,17 +166,15 @@ def get_proprioceptive_state(data: mujoco.MjData, model: mujoco.MjModel, env) ->
     
     return state
 
-def get_end_effector_position(data: mujoco.MjData, model: mujoco.MjModel) -> np.ndarray:
+def get_end_effector_position(data: mujoco.MjData, model: mujoco.MjModel, env=None) -> np.ndarray:
     """
-    获取末端执行器位置
+    获取末端执行器位置（Task3：优先用 env.end_effector_id=rq_base_mount；Panda 兼容 'hand'）
     """
-    try:
-        # 尝试获取hand body的位置
+    hand_id = int(getattr(env, 'end_effector_id', -1)) if env is not None else -1
+    if hand_id < 0:
         hand_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "hand")
-        if hand_id >= 0 and len(data.xpos) > hand_id:
-            return data.xpos[hand_id].copy()
-    except:
-        pass
+    if hand_id >= 0 and len(data.xpos) > hand_id:
+        return data.xpos[hand_id].copy()
     
     # 如果无法获取hand位置，使用最后一个关节的位置
     if len(data.xpos) > 0:

@@ -17,20 +17,25 @@
       </default>
       <default class="collision">
         <geom type="mesh" group="3"/>
+        <!-- P4 (2026-08-20): 指尖衬垫接触加硬（solref=1ms/0.999（高刚））。
+             实测：默认软接触(20ms)下 64g 立方体在 0.2m 抬升中蠕动倾覆、~0.075m 处滑脱；
+             加硬 + 主衬垫加宽加高（大接触斑）后，配合 lift_speed=0.003 慢抬，
+             立方体 100% 刚性跟随（~494 步到 0.2m、宽度恒 0.0345 不滑脱）。
+             注：0.005 时仍有 ~6% 滞后滑移（伺服/动态滞后），0.003 消除之。 -->
         <default class="fingertip_pad_collision_1">
-          <geom type="box" size="0.0085 0.004 0.0085" pos="0 0.0055 0.0445"/>
+          <geom type="box" solref="0.001 1" solimp="0.999 0.999 0.001" size="0.012 0.004 0.015" pos="0 0.0055 0.0445"/>
         </default>
         <default class="fingertip_pad_collision_2">
-          <geom type="box" size="0.003 0.002 0.003" pos="0.0055 0.002 0.05"/>
+          <geom type="box" solref="0.001 1" solimp="0.999 0.999 0.001" size="0.003 0.002 0.003" pos="0.0055 0.002 0.05"/>
         </default>
         <default class="fingertip_pad_collision_3">
-          <geom type="box" size="0.003 0.002 0.003" pos="-0.0055 0.002 0.05"/>
+          <geom type="box" solref="0.001 1" solimp="0.999 0.999 0.001" size="0.003 0.002 0.003" pos="-0.0055 0.002 0.05"/>
         </default>
         <default class="fingertip_pad_collision_4">
-          <geom type="box" size="0.003 0.002 0.0035" pos="0.0055 0.002 0.0395"/>
+          <geom type="box" solref="0.001 1" solimp="0.999 0.999 0.001" size="0.003 0.002 0.0035" pos="0.0055 0.002 0.0395"/>
         </default>
         <default class="fingertip_pad_collision_5">
-          <geom type="box" size="0.003 0.002 0.0035" pos="-0.0055 0.002 0.0395"/>
+          <geom type="box" solref="0.001 1" solimp="0.999 0.999 0.001" size="0.003 0.002 0.0035" pos="-0.0055 0.002 0.0395"/>
         </default>
       </default>
     </default>
@@ -262,19 +267,34 @@
   </equality>
 
   <actuator>
-    <general class="panda" name="actuator1" joint="joint1" gainprm="4500" biasprm="0 -4500 -450"/>
-    <general class="panda" name="actuator2" joint="joint2" gainprm="4500" biasprm="0 -4500 -450"
+    <!-- P2-1 arm servo stiffness fix (2026-08-19): 原位置伺服刚度不足，重载下稳态下垂
+         ~10mm（error=负载/增益：joint2 -29Nm/4500、joint4 18.4Nm/3500 恰好解释实测
+         0.369°/0.301° 误差），使 run_lift_primitive 的绝对抬升目标达不到。
+         增益×10（biasprm 阻尼同比×10，阻尼比不变，伺服动态特性保持一致）→ 下垂 ~1mm，
+         近似真实 Panda 高增益+重力补偿的位置控制（跟踪精度 mm 级）。 -->
+    <general class="panda" name="actuator1" joint="joint1" gainprm="45000" biasprm="0 -45000 -4500"/>
+    <general class="panda" name="actuator2" joint="joint2" gainprm="45000" biasprm="0 -45000 -4500"
       ctrlrange="-1.7628 1.7628"/>
-    <general class="panda" name="actuator3" joint="joint3" gainprm="3500" biasprm="0 -3500 -350"/>
-    <general class="panda" name="actuator4" joint="joint4" gainprm="3500" biasprm="0 -3500 -350"
+    <general class="panda" name="actuator3" joint="joint3" gainprm="35000" biasprm="0 -35000 -3500"/>
+    <general class="panda" name="actuator4" joint="joint4" gainprm="35000" biasprm="0 -35000 -3500"
       ctrlrange="-3.0718 -0.0698"/>
-    <general class="panda" name="actuator5" joint="joint5" gainprm="2000" biasprm="0 -2000 -200" forcerange="-12 12"/>
-    <general class="panda" name="actuator6" joint="joint6" gainprm="2000" biasprm="0 -2000 -200" forcerange="-12 12"
+    <general class="panda" name="actuator5" joint="joint5" gainprm="20000" biasprm="0 -20000 -2000" forcerange="-12 12"/>
+    <general class="panda" name="actuator6" joint="joint6" gainprm="20000" biasprm="0 -20000 -2000" forcerange="-12 12"
       ctrlrange="-0.0175 3.7525"/>
-    <general class="panda" name="actuator7" joint="joint7" gainprm="2000" biasprm="0 -2000 -200" forcerange="-12 12"/>
+    <general class="panda" name="actuator7" joint="joint7" gainprm="20000" biasprm="0 -20000 -2000" forcerange="-12 12"/>
     <!-- Remap original ctrlrange (0, 0.04) to (0, 255): 0.04 * 100 / 255 = 0.01568627451 -->
-    <general class="panda" name="actuator8" tendon="split" forcerange="-100 100" ctrlrange="0 255"
-      gainprm="0.01568627451 0 0" biasprm="0 -100 -10"/>
+    <!-- P2-1 grip authority fix (2026-08-19):
+         原参数夹持力 = 100*len(肌腱长)，在 0.04m 物体处仅 ~2N，摩擦(μ=1)不足以抬起
+         0.064kg 立方体（重量0.63N），抬起时物体下滑。
+         第一轮加强（×10，biasprm[1]=-1000，gainprm=0.196）后实测接触法向力仅 5.2N
+         （≈26% 肌腱张力，因衬垫只压入物体 ~1mm 的浅接触），立方体随手上移但仍以
+         ~0.6mm/s 摩擦蠕滑，抬升 0.15 后比衬垫面低 ~13mm，仍达不到 hold 阈值。
+         本轮再加强 7 倍（合计 ~140N 肌腱张力，接近真实 Panda 夹持力），biasprm 阻尼
+         同比 ×7 保持阻尼比；gainprm 同比 ×7 保证 ctrl=255 张开力 = 350-7000*len 恒为正
+         （len≤0.04 时 ≥70N），forcerange 加宽到 ±200 以免张开/闭合力被截断。
+         语义不变：ctrl=0 闭合 / ctrl=255 张开，仅力/阻尼放大。 -->
+    <general class="panda" name="actuator8" tendon="split" forcerange="-200 200" ctrlrange="0 255"
+      gainprm="1.37254901961 0 0" biasprm="0 -7000 -350"/>
   </actuator>
 
   <keyframe>

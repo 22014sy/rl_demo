@@ -1,120 +1,94 @@
 """
-安全动作包装器
-提供渐进式奇异点处理和动作安全约束，包含肌腱控制
+安全动作包装器（P3 重构：末端位姿增量 -> DLS IK -> 关节位置伺服目标）
+
+动作空间：
+  action_space_dim = 6 -> [dx, dy, dz, dax, day, daz]
+      位置增量 (m) + 姿态增量 (rad，旋转向量)
+  action_space_dim = 3 -> [dx, dy, dz]
+      仅位置，姿态固定为"朝下接近"抓取姿态
+
+流程：把末端位姿增量叠加到当前 EE 位姿，经 ik.solve_ik 反解为目标关节位形，
+返回 'joint_commands'（写 ctrl[:7]，位置伺服）。IK 误差超过 ik_error_hold 时
+保持当前位置不动，避免朝不可达目标乱动。
+
+夹爪（ctrl[7]）不再经此包装器：由环境内部的"近距自动闭合状态机"驱动（P3）。
 """
 
 import numpy as np
 import logging
-from typing import Dict, Any
+
+from ik import quat_mul, axis_angle_to_quat, solve_ik
+from reward import Q_APPROACH_DOWN
+
 
 class SafeActionWrapper:
-    """安全动作包装器"""
-    
+    """安全动作包装器（末端位姿增量控制）"""
+
     def __init__(self, env):
         self.env = env
         self.logger = logging.getLogger(__name__)
-        
-        # 安全参数
-        # P1: 动作前7维为每步关节增量(rad)，增量式位置控制；上限来自配置
-        self.max_joint_delta = float(getattr(env.grasping_config, 'max_joint_delta', 0.05))
-        self.singularity_threshold = 0.1  # 提高可操作度阈值，减少误报
-        self.slowdown_factor = 0.3  # 奇异点附近降速因子
-        self.max_tension = 100.0  # 最大允许张力(N)
-        
-        # 关节限制
-        self.joint_limits = {
-            'joint1': (-2.8973, 2.8973),
-            'joint2': (-1.7628, 1.7628),
-            'joint3': (-2.8973, 2.8973),
-            'joint4': (-3.0718, -0.0698),
-            'joint5': (-2.8973, 2.8973),
-            'joint6': (-0.0175, 3.7525),
-            'joint7': (-2.8973, 2.8973)
-        }
-        
-        # 奇异点处理参数
-        self.singularity_slowdown_factors = {
-            'elbow': 0.2,      # 肘部奇异点：更慢
-            'wrist': 0.3,      # 腕部奇异点：中等
-            'shoulder': 0.4,   # 肩部奇异点：较快
-            'jacobian': 0.1,   # 雅可比奇异：最慢
-            'default': 0.3     # 默认降速
-        }
-    
-    def apply(self, raw_action: np.ndarray, current_state: Dict[str, Any]) -> Dict[str, np.ndarray]:
-        """
-        将原始动作转换为安全的目标关节位置（增量式位置控制）
 
-        P1 重构：前7维 = 每步关节增量(rad)，第8维 = 肌腱命令(0=闭合,1=张开)。
-        执行器是位置伺服（ctrl=目标位置），因此输出 = 当前 qpos + 增量，
-        而不是旧版错误的“当前速度±0.005 当作位置目标”（导致手臂几乎不可控）。
+        # P3 动作空间参数（来自 GraspingConfig）
+        cfg = env.grasping_config
+        self.action_space_dim = int(getattr(cfg, 'action_space_dim', 6))
+        self.max_ee_delta = float(getattr(cfg, 'max_ee_delta', 0.02))
+        self.max_orient_delta = float(getattr(cfg, 'max_orient_delta', 0.05))
+        self.ik_error_hold = float(getattr(cfg, 'ik_error_hold', 0.02))
+
+    def apply(self, raw_action: np.ndarray, current_state) -> dict:
         """
-        # 解析动作
+        把原始动作（末端位姿增量）转换为安全的目标关节位置（增量式末端控制）。
+
+        P3 重构：RL 只输出末端位姿增量，不再直接控制关节/肌腱。
+        """
+        # 1. 解析并限幅动作
         if isinstance(raw_action, np.ndarray):
-            joint_deltas = np.asarray(raw_action[:7], dtype=np.float64)
-            tendon_command = float(raw_action[7]) if len(raw_action) > 7 else 0.0
+            a = np.asarray(raw_action, dtype=np.float64).ravel()
         else:
-            action_dict = raw_action.copy()
-            joint_deltas = np.asarray(action_dict.get('joint_commands', np.zeros(7)), dtype=np.float64)
-            tendon_command = float(action_dict.get('tendon_command', 0.0))
+            a = np.asarray(raw_action.get('ee_delta', np.zeros(self.action_space_dim)),
+                           dtype=np.float64).ravel()
+        if a.size < self.action_space_dim:
+            a = np.concatenate([a, np.zeros(self.action_space_dim - a.size)])
 
-        current_joint_pos = np.asarray(current_state.get('joint_positions', np.zeros(7)), dtype=np.float64)
+        pos_delta = np.clip(a[:3], -self.max_ee_delta, self.max_ee_delta)
+        if self.action_space_dim >= 6:
+            ori_delta = np.clip(a[3:6], -self.max_orient_delta, self.max_orient_delta)
+        else:
+            ori_delta = np.zeros(3)
 
-        # 1. 关节增量限幅（保证增量式位置控制稳定）
-        joint_deltas = np.clip(joint_deltas, -self.max_joint_delta, self.max_joint_delta)
+        # 2. 当前 EE 位姿 -> 目标位姿
+        cur_pos = np.asarray(current_state.get('ee_position', np.zeros(3)), dtype=np.float64)
+        cur_quat = np.asarray(current_state.get('ee_orientation',
+                                                np.array([1.0, 0.0, 0.0, 0.0])),
+                              dtype=np.float64)
+        target_pos = cur_pos + pos_delta
 
-        # 2. 奇异点降速（在增量上缩放，与 SingularityHandler 协调）
-        if hasattr(self.env, 'singularity_handler'):
-            is_singular, singularity_type, singularity_score = self.env.singularity_handler.detect_singularity(current_joint_pos)
-            if is_singular:
-                slowdown_factor = self._get_singularity_slowdown_factor(singularity_type, singularity_score)
-                joint_deltas *= slowdown_factor
-                if self.logger.isEnabledFor(logging.DEBUG):
-                    self.logger.debug(f"奇异点处理: 类型={singularity_type}, 程度={singularity_score:.3f}, 降速因子={slowdown_factor:.2f}")
+        if self.action_space_dim >= 6:
+            # 姿态增量按旋转向量叠加到当前朝向（小角度、无万向节死锁）
+            dq = axis_angle_to_quat(ori_delta)
+            target_quat = quat_mul(dq, cur_quat)
+            target_quat = target_quat / np.linalg.norm(target_quat)
+        else:
+            # 3 维模式：姿态固定为目标抓取姿态（物体朝向 ⊗ 朝下接近）
+            q_obj = np.asarray(current_state.get('target_orientation',
+                                                 np.array([1.0, 0.0, 0.0, 0.0])),
+                               dtype=np.float64)
+            target_quat = quat_mul(q_obj, Q_APPROACH_DOWN) if q_obj.size >= 4 else Q_APPROACH_DOWN
 
-        # 3. 目标关节位置 = 当前 + 增量，裁剪到关节限位
-        target_positions = current_joint_pos + joint_deltas
-        for i, (joint_name, (low, high)) in enumerate(self.joint_limits.items()):
-            target_positions[i] = np.clip(target_positions[i], low, high)
+        # 3. DLS IK 反解目标关节位形（纯函数，不改动主 data）
+        model, data = self.env.model, self.env.data
+        hand_id = self.env.end_effector_id
+        arm_joints = self.env.arm_joint_ids
+        q_target, err = solve_ik(model, data, hand_id, target_pos, target_quat, arm_joints)
 
-        # 4. 肌腱命令限幅 [0,1]（0=闭合, 1=张开）
-        tendon_command = float(np.clip(tendon_command, 0.0, 1.0))
+        # 4. IK 不可达 -> 保持当前位置（不朝不可达目标乱动）
+        if err > self.ik_error_hold:
+            q_target = data.qpos[arm_joints].copy()
+            if self.logger.isEnabledFor(logging.DEBUG):
+                self.logger.debug(f"IK 位置误差 {err:.4f} m > {self.ik_error_hold}，保持当前位置")
 
-        return {
-            'joint_commands': target_positions,   # ctrl[:7] = 目标位置
-            'tendon_command': tendon_command,     # ctrl[7] = int(cmd*255)，0=闭合
-            'gripper_command': tendon_command
-        }
-    
-    def _get_singularity_slowdown_factor(self, singularity_type: str, singularity_score: float) -> float:
-        """
-        根据奇异点类型和程度获取降速因子
-        
-        Args:
-            singularity_type: 奇异点类型
-            singularity_score: 奇异程度 (0-1)
-            
-        Returns:
-            slowdown_factor: 降速因子
-        """
-        # 基础降速因子
-        base_factor = self.singularity_slowdown_factors.get(singularity_type, self.singularity_slowdown_factors['default'])
-        
-        # 根据奇异程度调整
-        if singularity_score > 0.9:  # 严重奇异
-            return base_factor * 0.5  # 进一步降速
-        elif singularity_score > 0.7:  # 中等奇异
-            return base_factor
-        else:  # 轻微奇异
-            return base_factor * 1.5  # 稍微放宽
-        
-        return base_factor
-    
-    def get_safe_initial_action(self) -> Dict[str, np.ndarray]:
-        """获取安全的初始动作（零增量=保持当前位形，肌腱半开）"""
-        return {
-            'joint_commands': np.zeros(7, dtype=np.float32),
-            'tendon_command': 0.5,
-            'gripper_command': 0.5
-        }
+        return {'joint_commands': q_target}
 
+    def get_safe_initial_action(self) -> dict:
+        """获取安全的初始动作（零增量 = 保持当前末端位姿）"""
+        return {'joint_commands': np.zeros(7, dtype=np.float32)}

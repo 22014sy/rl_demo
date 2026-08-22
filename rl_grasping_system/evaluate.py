@@ -8,6 +8,12 @@ import sys
 import logging
 import argparse
 import numpy as np
+
+# P0-3: 无头环境强制 matplotlib 非交互 Agg 后端（默认只保存 PNG，不弹窗）。
+# 需要交互窗口时设 SHOW_PLOTS=1（且要有可用 DISPLAY），否则 plot_results 里的
+# plt.show() 在 DISPLAY 不可用时会因 Qt xcb 初始化失败而 Aborted (core dumped)。
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from datetime import datetime
 
@@ -215,7 +221,9 @@ def plot_results(results, save_path: str = None):
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         logger.info(f"结果图已保存到: {save_path}")
     
-    plt.show()
+    # P0-3: 默认不弹窗（Agg 后端 + 显式开关），避免无头环境 Qt 崩溃
+    if os.environ.get('SHOW_PLOTS') == '1':
+        plt.show()
 
 def save_results(results, save_path: str):
     """保存评估结果"""

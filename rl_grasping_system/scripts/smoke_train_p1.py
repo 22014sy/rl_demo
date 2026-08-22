@@ -23,7 +23,7 @@ PKG = os.path.dirname(HERE)
 sys.path.insert(0, PKG)
 
 from agent import GraspingAgent  # noqa: E402
-from environment import PandaGraspingEnv  # noqa: E402
+from environment import GraspingEnv  # noqa: E402
 from config import get_config  # noqa: E402
 
 
@@ -42,7 +42,7 @@ def main():
         stream=sys.stdout,
     )
 
-    env = PandaGraspingEnv(cfg.grasping, cfg.reward)
+    env = GraspingEnv(cfg.grasping, cfg.reward)
     agent = GraspingAgent(cfg.network, cfg.training)
     agent.set_environment(env)
     agent.train(total_timesteps=steps)

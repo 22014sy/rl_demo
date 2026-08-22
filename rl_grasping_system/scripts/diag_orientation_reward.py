@@ -61,8 +61,8 @@ def main():
                          cfg.reward)
     _show(b)
 
-    print("\n=== 逐 step 分量（动作：全关节小增量+夹爪半开，观察 r_orient 随姿态变化）===")
-    act = np.array([0.01] * 7 + [0.5], dtype=np.float32)
+    print("\n=== 逐 step 分量（动作：姿态增量 [0,0,0,0.02,0.02,0.02]，观察 r_orient 随姿态变化（P3：6 维末端位姿动作））===")
+    act = np.array([0.0, 0.0, 0.0, 0.02, 0.02, 0.02], dtype=np.float32)
     print(f"{'step':>4} | {'joint6':>6} | {'z_axis_z':>8} | {'align':>6} | {'r_orient':>8} | "
           f"{'r_xy':>7} | {'r_z':>7} | {'total':>8}")
     for i in range(n_steps):

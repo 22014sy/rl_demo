@@ -47,9 +47,9 @@ python evaluate.py --model_path models/final_model.zip
 
 #### 1. 环境模块 (`environment.py`)
 - **PandaGraspingEnv**: 基于MuJoCo的抓取环境
-- **状态空间**: 关节位置/速度/力矩、末端执行器位置/方向/速度、夹爪状态、目标信息
-- **动作空间**: 关节命令 + 夹爪控制
-- **奖励函数**: 距离奖励、抓取奖励、完成奖励、惩罚机制
+- **状态空间**: 关节位置/速度/力矩、末端执行器位置/方向/速度、夹爪状态、目标信息、相对接近姿态四元数（P2-2：`q_target_approach ⊗ q_ee⁻¹`，观测 58 维；P3 追加 1 维夹爪状态机相位）
+- **动作空间**: 末端位姿增量（action_space_dim=6 → [dx,dy,dz,dax,day,daz]；=3 → [dx,dy,dz] 仅位置、姿态固定朝下），经 DLS IK 反解为关节位置伺服目标；夹爪由环境内"近距自动闭合状态机"驱动（RL 不再输出肌腱命令）
+- **奖励函数**: 距离势能塑形、方向项、接触、抓取/完成奖励、时间惩罚（P3：抓取成功 = 手指被物体挡住合不上）
 
 #### 2. 智能体模块 (`agent.py`)
 - **GraspingAgent**: PPO智能体封装
@@ -97,7 +97,7 @@ norm_obs_clip: float = 10.0         # 观察裁剪
 norm_reward_clip: float = 10.0      # 奖励裁剪
 ```
 
-### 奖励配置（P1.3 势能塑形，见 reward.py）
+### 奖励配置（P1.3 势能塑形 + P2-1 方向项/抓取门控，见 reward.py）
 ```python
 # 位置目标 = 物体中心正上方（pre-grasp 位姿，hand 基座物理可达）
 pre_grasp_offset_z: float = 0.10   # hand 基座悬停高度
@@ -107,15 +107,36 @@ w_xy: float = 2.0                  # 平面距离权重
 w_height: float = 2.0              # 高度权重
 xy_scale: float = 0.3              # 平面距离归一化尺度(m)
 height_scale: float = 0.15         # 高度归一化尺度(m)
-w_orient: float = 2.0              # 手指朝下(目标抓取姿态)对齐权重
+w_orient: float = 5.0              # 方向奖励权重：gain = w_orient * (-z_axis_z)
 shaping_gamma: float = 0.99        # 势能塑形折扣
 
 # 事件奖励（一次性/每步，量级与典型单步奖励相当）
 w_contact: float = 1.0             # 手指接触物体
-grasp_reward: float = 5.0          # is_grasped（到位+夹紧+接触）
+grasp_reward: float = 5.0          # is_grasped（P3：手指被物体挡住合不上，开度仍 > grasp_min_width）
 completion_reward: float = 10.0    # grasp_success
 step_penalty: float = 0.01         # 时间惩罚
 ```
+
+> **P2-1 方向项（已改）**：旧实现是 `w_orient*max(0, align)`（align=手指与目标
+> 抓取姿态的四元数对齐 cos(θ)）。当夹爪与目标夹角 θ>90° 时 max(0,·) 截断使梯度恒为 0，
+> 形成死区——策略学到“横夹/侧夹物体骗成功”，可视化里夹爪总不竖直向下。
+> 新实现改为 **手指朝下投影** `gain = w_orient * (−z_axis_z)`（z_axis_z=手指方向世界
+> Z 分量）：朝下 +1、水平 0、朝上 −1，全程连续有梯度，且不过度约束绕手指轴的自转
+> （roll），保留 `align` 仅作诊断。
+
+> **P2-1 抓取门控（已加）**：`GraspingConfig.min_finger_down_z = −0.9`。`is_grasped` /
+> `grasp_success` 除原有 距离+夹紧+双指接触 外，新增 **手指方向门控**：须 `z_axis_z
+> ≤ min_finger_down_z`（手指在世界系下基本朝下）才算成功。横夹/朝上不再被当作成功。
+> 设 `min_finger_down_z=0.0` 可关闭方向检查（等价旧行为）。
+> **P3 抓取判定重构（已改，替代 P2-1 门控）**：动作空间改为末端位姿增量（6/3 维），夹爪由近距自动闭合状态机驱动（`gripper_close_distance` 触发、`gripper_open_distance` 滞回），抓取成功 = 手指被物体挡住合不上（闭合后开度仍 > `grasp_min_width=0.02` 且双指接触）；已移除全部 lift 原语（`run_lift_primitive`/`lift_height`）。旧模型（8 维动作/57 维观测）不兼容，需重训。详见 `docs/P3_末端位姿控制与动作空间重构设计.md`。
+> **P4 成功后的抬升（已加）**：`grasp_success` 后环境自动进入抬升状态机，夹爪保持闭合
+> 并向上抬升 `lift_height=0.2m`（`lift_speed=0.003m/步`，实测 0.01 太快会 ~10 步甩脱、
+> 0.005 仍有 ~6% 滞后滑移，0.003 时物体 100% 刚性跟随、~494 步到位），
+> 到位或失夹/超时即结束 episode；成功时在 MuJoCo 原生窗口左上角叠加显示 "succeed"。
+> P4 物理修复（2026-08-20）：`max_steps` 只计抬升前步数（抬升是自动阶段 ~494 步，不消耗
+> RL 预算，见 `environment.step` 的 truncated 判定）；`panda.xml` 指尖衬垫接触加硬
+> （`solref=0.001/0.999`）+ 主衬垫加宽加高，使 64g 立方体在抬升中不蠕动倾覆（默认软接触
+> 下 ~0.075m 即滑脱；加硬 + `lift_speed=0.003` 后稳定跟随 100%、宽度不滑脱）。
 
 ## 归一化技术
 

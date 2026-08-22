@@ -1,313 +1,114 @@
 """
-奇异点检测和处理模块
-处理Panda机械臂的奇异点问题：基于雅可比条件数/最小奇异值检测，
-检测到奇异时给出渐进安全配置并检查恢复；后续可迁移到 MOVEIT 的自检测。
+奇异点检测和处理模块（Task3：UR5e 6 关节版；原 Panda 7 关节版已替换）
+
+检测：关节限位 + 已知奇异位形（肩奇异 shoulder_lift≈±π/2、肘伸直 elbow≈0、腕奇异 wrist_2≈0）。
+处理：渐进移回 safe_config（home 附近）。速度模式下 velocity_ik 阻尼伪逆本身奇异鲁棒，
+      奇异只触发告警 + 速度置零（防御）。
 """
 
 import numpy as np
+import mujoco
 import logging
-from typing import Tuple, Optional
+from typing import Tuple
+
 
 class SingularityHandler:
-    """奇异点处理器"""
-    
+    """UR5e 奇异点处理器（6 关节）"""
+
     def __init__(self):
         self.logger = logging.getLogger(__name__)
-        
-        # Panda机械臂的关节限制
+
+        # UR5e 关节限制 (rad)
         self.joint_limits = {
-            'joint1': (-2.8973, 2.8973),
-            'joint2': (-1.7628, 1.7628),
-            'joint3': (-2.8973, 2.8973),
-            'joint4': (-3.0718, -0.0698),
-            'joint5': (-2.8973, 2.8973),
-            'joint6': (-0.0175, 3.7525),
-            'joint7': (-2.8973, 2.8973)
+            'shoulder_pan': (-6.28319, 6.28319),
+            'shoulder_lift': (-6.28319, 6.28319),
+            'elbow': (-3.1415, 3.1415),
+            'wrist_1': (-6.28319, 6.28319),
+            'wrist_2': (-6.28319, 6.28319),
+            'wrist_3': (-6.28319, 6.28319),
         }
-        
-        # 已知的奇异点配置（大幅增加容忍度）
+        # 关节名 -> 数组索引
+        self._idx = {'shoulder_pan': 0, 'shoulder_lift': 1, 'elbow': 2,
+                     'wrist_1': 3, 'wrist_2': 4, 'wrist_3': 5}
+
+        # 已知奇异位形（UR5e 运动学奇异；注意 shoulder_lift 单独取值不构成奇异，
+        # 肩奇异需 elbow 伸直+wrist_2=0 组合，故不在此列——避免 home(-π/2) 误报）
         self.singularity_configs = [
-            # 肘部奇异点：joint3接近±π/2
-            {'joint3': np.pi/2, 'tolerance': 0.5},   # 增加容忍度到0.5弧度
-            {'joint3': -np.pi/2, 'tolerance': 0.5},
-            
-            # 腕部奇异点：joint5接近±π/2（进一步放宽）
-            {'joint5': np.pi/2, 'tolerance': 0.3},   # 降低容忍度，减少误报
-            {'joint5': -np.pi/2, 'tolerance': 0.3},
-            
-            # 肩部奇异点：joint2接近±π/2（进一步放宽）
-            {'joint2': np.pi/2, 'tolerance': 0.3},   # 降低容忍度，减少误报
-            {'joint2': -np.pi/2, 'tolerance': 0.3},
+            {'elbow': 0.0, 'tolerance': 0.25},        # 肘伸直
+            {'wrist_2': 0.0, 'tolerance': 0.3},       # 腕奇异
         ]
-        
-        # 安全配置（远离奇异点）
-        self.safe_config = np.array([0.0, 0.0, 0.0, -1.5708, 0.0, 1.5708, 0.7854])
-        
-        # 警告控制
-        self.warning_cooldown = 0  # 警告冷却时间
-        self.last_warning_time = 0  # 上次警告时间
-        self.warning_interval = 30.0  # 警告间隔（秒）- 大幅延长
-    
-    def detect_singularity(self, joint_positions: np.ndarray) -> Tuple[bool, str, float]:
-        """
-        检测是否处于奇异点
-        
-        Args:
-            joint_positions: 关节位置数组 [7,]
-            
-        Returns:
-            is_singular: 是否处于奇异点
-            singularity_type: 奇异点类型
-            singularity_score: 奇异点程度 (0-1)
-        """
-        if len(joint_positions) < 7:
+
+        # 安全配置（home 附近：指尖朝下悬于 cube 上方，远离奇异、可达）
+        self.safe_config = np.array([-1.5708, -1.5708, 1.5708, -1.5708, -1.5708, 0.0])
+
+        self.warning_cooldown = 0
+        self.last_warning_time = 0
+        self.warning_interval = 30.0
+
+    def detect_singularity(self, joint_positions) -> Tuple[bool, str, float]:
+        if joint_positions is None or len(joint_positions) < 6:
             return False, "invalid", 0.0
-        
-        # 检查关节限制
-        for i, (joint_name, (low, high)) in enumerate(self.joint_limits.items()):
-            if joint_positions[i] < low or joint_positions[i] > high:
-                return True, f"joint_limit_{joint_name}", 1.0
-        
-        # 检查已知奇异点配置
-        max_score = 0.0
-        singularity_type = "none"
-        
-        for config in self.singularity_configs:
-            for joint_name, target_value in config.items():
-                if joint_name == 'joint3':
-                    joint_idx = 2
-                elif joint_name == 'joint5':
-                    joint_idx = 4
-                elif joint_name == 'joint2':
-                    joint_idx = 1
-                else:
+        jp = np.asarray(joint_positions, dtype=float)
+
+        # 关节限位
+        for i, (name, (lo, hi)) in enumerate(self.joint_limits.items()):
+            if jp[i] < lo or jp[i] > hi:
+                return True, f"joint_limit_{name}", 1.0
+
+        max_score, s_type = 0.0, "none"
+        for cfg in self.singularity_configs:
+            tol = cfg['tolerance']
+            for name, target in cfg.items():
+                if name == 'tolerance':
                     continue
-                
-                # 计算与奇异点的距离
-                distance = abs(joint_positions[joint_idx] - target_value)
-                tolerance = config['tolerance']
-                
-                # 计算奇异点程度 (0-1)
-                if distance < tolerance:
-                    score = 1.0 - (distance / tolerance)
-                    if score > max_score:
-                        max_score = score
-                        singularity_type = f"singularity_{joint_name}"
-        
-        # 检查雅可比矩阵条件数（简化版本）
-        jacobian_condition = self._estimate_jacobian_condition(joint_positions)
-        # 大幅提高阈值：条件数 > 500 才认为是奇异
-        if jacobian_condition > 500:  # 提高阈值从300到500
-            score = min(1.0, (jacobian_condition - 500) / 500)  # 重新归一化
-            if score > max_score:
-                max_score = score
-                singularity_type = "jacobian_singularity"
-        
-        # 大幅提高检测阈值：只有分数 > 0.9 才认为是奇异点
-        return max_score > 0.9, singularity_type, max_score
-    
-    def _estimate_jacobian_condition(self, joint_positions: np.ndarray) -> float:
-        """
-        估算雅可比矩阵的条件数（改进版本）
-        
-        Args:
-            joint_positions: 关节位置
-            
-        Returns:
-            condition_number: 条件数估计值
-        """
-        # 改进的雅可比矩阵条件数估计
-        # 只检查真正的奇异点附近
-        
-        # 检查肘部奇异点 (joint3 接近 ±π/2)
-        elbow_angle = joint_positions[2]  # joint3
-        elbow_singularity = abs(abs(elbow_angle) - np.pi/2)
-        
-        # 检查腕部奇异点 (joint5 接近 ±π/2)
-        wrist_angle = joint_positions[4]  # joint5
-        wrist_singularity = abs(abs(wrist_angle) - np.pi/2)
-        
-        # 检查肩部奇异点 (joint2 接近 ±π/2)
-        shoulder_angle = joint_positions[1]  # joint2
-        shoulder_singularity = abs(abs(shoulder_angle) - np.pi/2)
-        
-        # 计算最小奇异距离
-        min_singularity_distance = min(elbow_singularity, wrist_singularity, shoulder_singularity)
-        
-        # 条件数估计：距离奇异点越近，条件数越大
-        # 大幅调整敏感度：只有非常接近奇异点才认为是奇异
-        if min_singularity_distance < 0.01:  # 非常接近奇异点（从0.02降低到0.01）
-            condition_number = 1000.0
-        elif min_singularity_distance < 0.1:  # 接近奇异点（从0.15降低到0.1）
-            condition_number = 500.0 + (0.1 - min_singularity_distance) * 500 / 0.09
-        else:  # 远离奇异点
-            condition_number = 50.0
-        
-        return condition_number
-    
-    def get_progressive_safe_action(self, current_config: np.ndarray, step_size: float = 0.05) -> np.ndarray:
-        """
-        生成渐进式安全动作，逐步远离奇异点
-        
-        Args:
-            current_config: 当前关节配置
-            step_size: 最大步长
-            
-        Returns:
-            safe_action: 渐进式安全动作
-        """
-        # 分析当前奇异点类型
-        is_singular, singularity_type, score = self.detect_singularity(current_config)
-        
-        if not is_singular:
-            return current_config  # 如果安全，保持当前配置
-        
-        # 根据奇异点类型生成渐进动作
-        safe_action = current_config.copy()
-        
-        if "elbow" in singularity_type:
-            # 肘部奇异：调整joint3，保持其他关节
-            elbow_angle = current_config[2]
-            if abs(elbow_angle - np.pi/2) < 0.1:
-                safe_action[2] += step_size  # 远离π/2
-            elif abs(elbow_angle + np.pi/2) < 0.1:
-                safe_action[2] -= step_size  # 远离-π/2
-                
-        elif "wrist" in singularity_type:
-            # 腕部奇异：调整joint5，保持其他关节
-            wrist_angle = current_config[4]
-            if abs(wrist_angle - np.pi/2) < 0.1:
-                safe_action[4] += step_size  # 远离π/2
-            elif abs(wrist_angle + np.pi/2) < 0.1:
-                safe_action[4] -= step_size  # 远离-π/2
-                
-        elif "shoulder" in singularity_type:
-            # 肩部奇异：调整joint2，保持其他关节
-            shoulder_angle = current_config[1]
-            if abs(shoulder_angle - np.pi/2) < 0.1:
-                safe_action[1] += step_size  # 远离π/2
-            elif abs(shoulder_angle + np.pi/2) < 0.1:
-                safe_action[1] -= step_size  # 远离-π/2
-                
-        else:
-            # 其他奇异点：向安全配置渐进移动
-            direction = self.safe_config - current_config
-            step = np.clip(direction, -step_size, step_size)
-            safe_action = current_config + step
-        
-        # 确保在关节限制内
-        for i, (joint_name, (low, high)) in enumerate(self.joint_limits.items()):
-            safe_action[i] = np.clip(safe_action[i], low, high)
-        
-        return safe_action
+                d = abs(jp[self._idx[name]] - target)
+                if d < tol:
+                    sc = 1.0 - d / tol
+                    if sc > max_score:
+                        max_score, s_type = sc, f"singularity_{name}"
+        return max_score > 0.0, s_type, max_score
 
-    def get_safe_config(self, current_config: np.ndarray) -> np.ndarray:
-        """
-        获取安全配置（使用渐进式方法）
-        
-        Args:
-            current_config: 当前配置
-            
-        Returns:
-            safe_config: 安全配置
-        """
+    def get_progressive_safe_action(self, current_config, step_size=0.05):
+        cur = np.asarray(current_config, dtype=float)
+        target = self.safe_config
+        delta = target - cur
+        step = np.clip(delta, -step_size, step_size)
+        if np.linalg.norm(delta) < step_size:
+            return target.copy()
+        return cur + step
+
+    def get_safe_config(self, current_config):
         return self.get_progressive_safe_action(current_config, step_size=0.05)
-    
-    def generate_safe_initial_config(self, rng=None) -> np.ndarray:
-        """
-        生成安全的初始配置
 
-        Args:
-            rng: 可选的随机数生成器（如 gymnasium 的 self.np_random）。
-                传入后初始位形由外部 seed 完全决定、可复现；None 时回退到全局 np.random。
-
-        Returns:
-            safe_config: 安全的初始配置
-        """
-        # 在更保守的安全范围内随机生成配置
-        safe_ranges = [
-            (-0.5, 0.5),     # joint1: 更保守的范围
-            (-0.3, 0.3),     # joint2: 避免肩部奇异
-            (-0.5, 0.5),     # joint3: 避免肘部奇异
-            (-2.0, -1.0),    # joint4: 更保守的范围
-            (-0.5, 0.5),     # joint5: 避免腕部奇异
-            (1.0, 2.0),      # joint6: 更保守的范围
-            (-0.5, 0.5),     # joint7: 更保守的范围
-        ]
-        
+    def generate_safe_initial_config(self, rng=None):
+        """UR5e 初始位形：围绕 home 小范围随机（home 时 pad 已悬于 cube 上方，利于学习）。
+        并行改造(2026-08-22): spread 0.3→0.15（课程式：先学近端精确微调→对齐→闭合，
+        后续训练稳定后可再放开；max_steps 已同步 300→200）。"""
+        spread = 0.15
         if rng is None:
             rng = np.random
-        config = np.array([
-            rng.uniform(low, high) for low, high in safe_ranges
-        ])
-        
-        # 验证配置安全性
+        config = self.safe_config + np.array([rng.uniform(-spread, spread) for _ in range(6)])
         is_singular, _, _ = self.detect_singularity(config)
-        if is_singular:
-            # 如果仍然奇异，使用预定义安全配置
-            config = self.safe_config.copy()
-        
-        return config
+        return self.safe_config.copy() if is_singular else config
 
-    def check_singularity_recovery(self, joint_positions: np.ndarray, 
-                                 previous_positions: np.ndarray) -> bool:
-        """
-        检查是否从奇异点恢复
-        
-        Args:
-            joint_positions: 当前关节位置
-            previous_positions: 前一步关节位置
-            
-        Returns:
-            recovered: 是否恢复
-        """
+    def check_singularity_recovery(self, joint_positions, previous_positions):
         was_singular, _, _ = self.detect_singularity(previous_positions)
         is_singular, _, _ = self.detect_singularity(joint_positions)
-        
         return was_singular and not is_singular
 
-    def detect_singularity_with_warning_control(self, joint_positions: np.ndarray, current_time: float = None) -> Tuple[bool, str, float, bool]:
-        """
-        带警告控制的奇异点检测
-        
-        Args:
-            joint_positions: 关节位置 [7,]
-            current_time: 当前时间（用于控制警告频率）
-            
-        Returns:
-            is_singular: 是否处于奇异点
-            singularity_type: 奇异点类型
-            singularity_score: 奇异程度 (0-1)
-            should_warn: 是否应该发出警告
-        """
+    def detect_singularity_with_warning_control(self, joint_positions, current_time=None):
         import time
-        
         if current_time is None:
             current_time = time.time()
-        
-        # 检测奇异点
-        is_singular, singularity_type, score = self.detect_singularity(joint_positions)
-        
-        # 警告控制逻辑
+        is_singular, s_type, score = self.detect_singularity(joint_positions)
         should_warn = False
-        
         if is_singular:
-            # 检查是否应该发出警告
             if current_time - self.last_warning_time > self.warning_interval:
                 should_warn = True
                 self.last_warning_time = current_time
-                
-                # 根据奇异程度调整警告间隔
-                if score > 0.9:  # 严重奇异
-                    self.warning_interval = 10.0  # 缩短间隔
-                elif score > 0.7:  # 中等奇异
-                    self.warning_interval = 30.0  # 标准间隔
-                else:  # 轻微奇异
-                    self.warning_interval = 60.0  # 大幅延长间隔
-        
-        return is_singular, singularity_type, score, should_warn
-    
+                self.warning_interval = 10.0 if score > 0.9 else (30.0 if score > 0.7 else 60.0)
+        return is_singular, s_type, score, should_warn
+
     def reset_warning_control(self):
-        """重置警告控制"""
         self.last_warning_time = 0
         self.warning_interval = 5.0

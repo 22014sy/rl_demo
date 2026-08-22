@@ -1,3 +1,9 @@
+"""奖励函数（P3 保持逻辑不变，仅成功定义随环境重构）。
+
+P3 起抓取成功 = 手指被物体挡住合不上（见 environment._update_gripper_state），`grasp_info['is_grasped'] == grasp_info['grasp_success'] == (phase == 'closed')`，
+奖励结构不变：距离/方向势能塑形 + 接触 + grasp_reward + completion_reward + 时间惩罚。
+"""
+
 import numpy as np
 
 
@@ -64,25 +70,52 @@ def orientation_align(q_hand, q_target):
 REWARD_KEYS = ('r_dist_xy', 'r_dist_z', 'r_orient', 'r_contact', 'r_grasp', 'r_success', 'r_step')
 
 
+def _anchor_boost(w, d, d_target):
+    """近距离锚定势能：d < d_target 时线性渐增（d=0 处 0，d=d_target 处 w，之外封顶 w）。
+
+    2026-08-22 混合方案：在主势能上叠加，使近距离斜率变陡
+    （斜率 = w/scale + w/d_target，如 xy ×3.5、z ×2.25），每靠近一步的塑形收益
+    γ·slope·Δd 显著超过 step_penalty，打破"A 训练停在够近但不精调"的收益权衡。
+    注意：必须单调（d 减 → Φ 减），d=0 处 Φ=0（目标处势能最小）——
+    曾误用 max(0,1−d/d_target) 使近距离非单调（靠近反被惩罚），已修正。
+    仍为势能差形式，累计有界、不改变最优策略。
+    """
+    if d_target <= 0.0:
+        return 0.0
+    return w * min(d / d_target, 1.0)
+
+
 def _dist_cost_xy(ee, target, cfg):
-    """平面(X/Y)距离代价势能（P1.1 去饱和线性项，低=好）。"""
+    """平面(X/Y)距离代价势能（P1.1 去饱和线性项 + 近距离锚定，低=好）。"""
     d_xy = float(np.linalg.norm(ee[:2] - target[:2]))
-    return cfg.w_xy * min(d_xy, cfg.xy_cap) / cfg.xy_scale
+    base = cfg.w_xy * min(d_xy, cfg.xy_cap) / cfg.xy_scale
+    return base + _anchor_boost(cfg.anchor_w_xy, d_xy, cfg.anchor_dist_xy)
 
 
 def _dist_cost_z(ee, target, cfg):
-    """高度(Z)距离代价势能（低=好）。"""
+    """高度(Z)距离代价势能（低=好，含近距离锚定）。"""
     dz = float(abs(ee[2] - target[2]))
-    return cfg.w_height * min(dz, cfg.height_cap) / cfg.height_scale
+    base = cfg.w_height * min(dz, cfg.height_cap) / cfg.height_scale
+    return base + _anchor_boost(cfg.anchor_w_z, dz, cfg.anchor_dist_z)
 
 
 def _orient_gain(state, cfg):
-    """方向收益势能（对齐度越高越大）+ 诊断量。
+    """方向收益势能（手指越朝下越大，全程连续无死区）+ 诊断量。
+
+    P2-1 修复：旧实现 `gain = w_orient * max(0, align)` 存在**死区**——
+    当夹爪与“手指朝下”目标的总角偏差 θ > 90°（align = cos(θ) < 0）时，
+    方向收益被 max(0,·) 截为 0，势能与塑形奖励在该区域恒为 0、无梯度。
+    策略于是只学“到位”不学“转向”，表现为可视化中夹爪水平/朝上抓取。
+
+    改为**手指朝下投影** `gain = w_orient * (-z_axis_z)`：
+      z_axis_z = 手指方向(hand 局部+Z)在世界系 Z 分量 ∈ [−1,1]
+      朝下=−1 → gain=+w_orient；水平=0 → 0；朝上=+1 → −w_orient。
+    全程有梯度、无死区，且不惩罚绕手指轴的 roll（对称夹爪不需要）。
 
     Returns: (orient_gain, align, z_axis_z)
-        orient_gain = w_orient * max(0, align)   （进入势能，负号表示“越对齐越接近目标”）
-        align        = cos(θ)，θ=手与目标抓取姿态相对转角(含roll)，∈[−1,1]
-        z_axis_z     = 手指方向在世界系Z分量（仅供诊断；朝下 <0）
+        orient_gain = w_orient * (−z_axis_z)  （进入势能，负号表示“越朝下越接近目标”）
+        align        = cos(θ)，与目标抓取姿态的完整四元数对齐(含roll)，仅供诊断
+        z_axis_z     = 手指方向在世界系Z分量（诊断；朝下 <0）
     """
     q = np.asarray(state.get('ee_orientation'), dtype=float)
     q_obj = np.asarray(state.get('target_orientation'), dtype=float)
@@ -90,8 +123,8 @@ def _orient_gain(state, cfg):
         return 0.0, 0.0, 0.0
     q_target = quat_mul(q_obj, Q_APPROACH_DOWN) if q_obj.size >= 4 else Q_APPROACH_DOWN
     align = orientation_align(q[:4], q_target)
-    gain = cfg.w_orient * max(0.0, align)
     z_axis_z = float(quat_rotate_world_z(q[:4])[2])
+    gain = cfg.w_orient * (-z_axis_z)  # 无死区：水平=0，朝上为负（惩罚），朝下为正
     return gain, align, z_axis_z
 
 
@@ -146,9 +179,29 @@ def reward_breakdown(state, prev_state, grasp_info, reward_config=None):
 
     # 接触 / 抓取 / 完成事件
     contact_force = float(grasp_info.get('contact_force', 0.0))
-    parts['r_contact'] = reward_config.w_contact if contact_force >= reward_config.contact_force_threshold else 0.0
-    parts['r_grasp'] = reward_config.grasp_reward if grasp_info.get('is_grasped', False) else 0.0
-    parts['r_success'] = reward_config.completion_reward if grasp_info.get('grasp_success', False) else 0.0
+    rising = grasp_info.get('grasp_success_rising', None)
+    lift_active = bool(grasp_info.get('lift_active', False))
+    if rising is None:
+        # 诊断/单状态调用：无上升沿标志 -> 电平式（每次调用独立，保持 P3 行为）
+        parts['r_contact'] = reward_config.w_contact if contact_force >= reward_config.contact_force_threshold else 0.0
+        parts['r_grasp'] = reward_config.grasp_reward if grasp_info.get('is_grasped', False) else 0.0
+        parts['r_success'] = reward_config.completion_reward if grasp_info.get('grasp_success', False) else 0.0
+    elif lift_active and not rising:
+        # P4: 抬升阶段——任务已交给自动状态机，事件奖励不再重复发放；
+        # 位置/方向塑形冻结（抬升由状态机执行，不该因"远离 pre-grasp 目标"被惩罚）
+        parts['r_contact'] = 0.0
+        parts['r_grasp'] = 0.0
+        parts['r_success'] = 0.0
+        if prev_state is not None:
+            parts['r_dist_xy'] = 0.0
+            parts['r_dist_z'] = 0.0
+            parts['r_orient'] = 0.0
+    else:
+        # 训练普通步：接触为电平式（接近阶段鼓励碰到物体）；
+        # 抓取/成功只在 grasp_success 上升沿一次性发放（成功当步 rising=True）
+        parts['r_contact'] = reward_config.w_contact if contact_force >= reward_config.contact_force_threshold else 0.0
+        parts['r_grasp'] = reward_config.grasp_reward if rising else 0.0
+        parts['r_success'] = reward_config.completion_reward if rising else 0.0
     parts['r_step'] = -reward_config.step_penalty
 
     # 纯诊断键（不进入 calculate_reward 的和）

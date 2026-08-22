@@ -4,6 +4,12 @@
 """
 
 import numpy as np
+# P0-3: 无头环境强制 matplotlib 非交互 Agg 后端。
+# 默认 qtagg 后端在 DISPLAY 不可用（WSL/SSH 残留的 :0）时，save_training_plots()
+# 创建 QtAgg 图会触发 Qt xcb 平台插件初始化失败 → Aborted (core dumped)。
+# 训练曲线只需落盘 PNG，不需要交互窗口。
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import json
 import os
@@ -71,7 +77,8 @@ class TrainingMonitor:
     
     def log_episode(self, episode: int, reward: float, length: int, 
                    success: bool, singularity_count: int = 0, 
-                   episode_time: float = 0.0):
+                   episode_time: float = 0.0,
+                   breakdown: Optional[Dict] = None):
         """
         记录一个episode的信息
         
@@ -104,7 +111,7 @@ class TrainingMonitor:
         self._print_progress(self.current_episode, reward, length, success, singularity_count, stats)
         
         # 保存到日志文件（使用内部episode编号）
-        self._save_to_log(self.current_episode, reward, length, success, singularity_count, episode_time, stats)
+        self._save_to_log(self.current_episode, reward, length, success, singularity_count, episode_time, stats, breakdown)
         
         # 定期保存图表（基于内部计数，避免0取模导致的每次都保存）
         if self.current_episode % self.plot_save_freq == 0 and self.save_plots:
@@ -169,7 +176,8 @@ class TrainingMonitor:
                 print(f"  训练趋势: {trend} (最近10 vs 前10: {recent_avg:.2f} vs {prev_avg:.2f})")
     
     def _save_to_log(self, episode: int, reward: float, length: int, 
-                    success: bool, singularity_count: int, episode_time: float, stats: Dict):
+                    success: bool, singularity_count: int, episode_time: float, stats: Dict,
+                    breakdown: Optional[Dict] = None):
         """保存到日志文件（P1 修复：不再读回文件，直接以内存数据整体写盘，避免读到写一半的文件）"""
         try:
             self._logged_episodes.append({
@@ -179,6 +187,7 @@ class TrainingMonitor:
                 "success": success,
                 "singularity_count": singularity_count,
                 "episode_time": episode_time,
+                "breakdown": breakdown if breakdown is not None else {},
                 "timestamp": datetime.now().isoformat()
             })
 
