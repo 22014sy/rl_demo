@@ -315,8 +315,15 @@ class GraspingAgent:
             }
         )
 
-        # 加载预训练模型
+        # 加载预训练模型（迁移学习）
         if self.model_path and os.path.exists(self.model_path):
+            # 2026-08-23 迁移学习恢复 VecNormalize 观测统计：若存在 <model>_vecnormalize.pkl，
+            # 先恢复 obs_rms/ret_rms，否则迁移初期观测归一化失配（stats 为初始值），
+            # 策略输出与训练时不一致，fine-tune 慢甚至失败。
+            _norm_pkl = os.path.splitext(self.model_path)[0] + "_vecnormalize.pkl"
+            if os.path.exists(_norm_pkl):
+                vec_env = VecNormalize.load(_norm_pkl, vec_env)
+                logger.info(f"迁移学习：已恢复 VecNormalize 观测统计 {_norm_pkl}")
             self.agent = PPO.load(self.model_path, env=vec_env)
             logger.info(f"加载预训练模型: {self.model_path}")
 
@@ -356,10 +363,12 @@ class GraspingAgent:
         grasping_callback.training_monitor = self.training_monitor if getattr(self, '_parallel', False) else None
         callbacks.append(grasping_callback)
 
-        # 检查点回调
+        # 检查点回调（2026-08-23: SB3 CheckpointCallback 的 save_freq 是"callback 调用次数"，
+        # 每 n_envs 步调用一次——须除以 n_envs 才是实际训练步数，否则永远不触发）
         if save_path:
+            _n_envs = max(int(getattr(self, 'n_envs', 1)), 1)
             checkpoint_callback = CheckpointCallback(
-                save_freq=self.training_config.save_freq,
+                save_freq=max(int(self.training_config.save_freq) // _n_envs, 1),
                 save_path=os.path.dirname(save_path),
                 name_prefix=os.path.basename(save_path).replace('.zip', '')
             )

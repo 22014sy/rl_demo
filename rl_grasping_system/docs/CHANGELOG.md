@@ -5,7 +5,165 @@
 
 ---
 
-## 2026-08-22 · 方案A+B：打通 closing→closed 最后一环（首次出现成功）
+## 2026-08-23 · 防崩溃修复（--no-demo + checkpoint 定期保存）
+
+### 背景
+PPO_97（复现 95 的重训）在 38/61 rollout 时因 **GLFW 演示窗口 segfault** 崩溃，
+日志尾部全是 NUL 垃圾，模型未保存（~93 万步白跑）。
+
+### 改动
+| 位置 | 内容 |
+|---|---|
+| `train_with_monitor.py` | 新增 `--no-demo` 参数：禁用演示窗口（后台/长训练推荐，消除 segfault 崩溃源）|
+| `train_with_monitor.py` | `agent.train` 传入 `save_path`（启用 CheckpointCallback 定期保存）|
+| `config.py` | `save_freq` 50000→**98304**（SB3 CheckpointCallback 要求是 n_steps×n_envs=24576 的倍数）|
+| `agent.py` | CheckpointCallback 的 `save_freq //= n_envs`（SB3 的 save_freq 是 callback 调用次数，每 n_envs 步调用一次；不除则永远不触发）|
+
+### 验证（短训 120000 步，--no-demo）
+- ✅ 演示窗口禁用（"演示窗口已禁用"）
+- ✅ **checkpoint 生成**：`test_ckpt_98304_steps.zip`（98304 步处）
+- ✅ 训练正常完成、最终模型保存、无崩溃
+
+### 说明
+- checkpoint 是 PPO 权重（SB3 CheckpointCallback 不含 VecNormalize stats）——崩溃恢复时
+  VecNormalize stats 从最近一次 `save` 的 `_vecnormalize.pkl` 恢复或重新累计
+- 崩溃最多损失 98304 步（~4 分钟）
+
+### 长训练推荐命令
+```bash
+python train_with_monitor.py --save-model final_model_fixed.zip --total-timesteps 1500000 --no-demo
+```
+
+---
+
+### 背景
+- PPO_95 模型被 PPO_96（位置随机从零训练，0% 成功率）覆盖，无备份
+- 需要重新训练固定位置模型（复现 95）并单独保存，避免再被覆盖
+
+### 改动（`train_with_monitor.py`）
+| 参数 | 作用 |
+|---|---|
+| `--save-model PATH` | 模型保存路径/文件名（默认 `models/final_model.zip`，可指定单独文件名避免覆盖）|
+| `--total-timesteps N` | 训练总步数（默认 config 值；复现 PPO_95 用 1500000）|
+
+### 用法
+```bash
+# 重新训练固定位置模型（复现 95），单独保存
+python train_with_monitor.py --save-model final_model_fixed.zip --total-timesteps 1500000
+```
+
+### PPO_96 失败教训
+- PPO_96 = 位置随机 ±3cm **从零训练** 1M 步 → 0% 成功率（r_contact=0，只学到"靠近"）
+- 位置随机任务收敛远慢于固定位置（需同时学"感知 target_position + 相对控制"）
+- **课程学习必须迁移加载**上一阶段模型（fine-tune），不能从零训练
+
+---
+
+### 背景
+PPO_95（固定位置）独立评估 91.7%，剩余 8.3% 失败是 XY 边缘对齐极限（收益递减）。
+进入课程学习：逐步引入物体位置随机，让策略泛化到任意位置。
+
+### 改动（`train_with_monitor.py`）
+新增课程学习 CLI 参数：
+| 参数 | 作用 |
+|---|---|
+| `--position-random` | 启用物体位置随机（`use_fixed_position=False`，围绕 `object_fixed_pos` ±radius）|
+| `--radius` | 随机半径(m)，阶段1=0.03、阶段2=0.06-0.08、阶段3=完整 workspace_bounds |
+| `--load-model` | 迁移加载上一阶段模型继续训练（agent 已有 model_path 支持）|
+
+### 验证
+- 位置随机正确（30 次 reset，cube X/Y 均在 ±3cm 范围）
+- 迁移加载 PPO_95 + 位置随机环境创建成功
+- 语法 OK
+
+### 用法（课程阶段 1）
+```bash
+python train_with_monitor.py --position-random --radius 0.03 --load-model models/final_model.zip
+```
+阶段 2：`--radius 0.06`；阶段 3：去掉 `--radius` 直接 `--position-random`（用完整 workspace_bounds）。
+
+---
+
+### 背景
+PPO_93 失败分析（10/60）定位到两个模式：
+| 模式 | 占比 | 现象 | 方案 |
+|---|---|---|---|
+| 未进 closing | 4/10 | pad-cube XY 3.6-5.1cm（阈值 3.0cm），差 0.6-2.1cm | ② closing 中间奖励 |
+| 进 closing 但空闭合 | 6/10 | pad 悬空（接触力 0，cube 顶面上方 ~1cm），手指合拢碰不到 | ① closing Z 微降 |
+
+### 改动
+| 方案 | 位置 | 内容 |
+|---|---|---|
+| ① | `environment.py` | closing 微调加 **Z 微降**（pad 未接触 cube 时微降到接触，接触后保持）|
+| ② | `config.py` + `reward.py` | 新增 `close_trigger_reward=5.0`；REWARD_KEYS 加 `r_close`（进入 closing 上升沿一次性发放）|
+| ③ | `reward.py` | 抬升阶段 `r_step=0`（抬升不计入训练步数也不扣步惩罚，一致性）|
+
+### 验证（PPO_93 模型 + 新环境，60 episodes）
+| 指标 | 之前 | 现在 |
+|---|---|---|
+| 成功率 | 83.3% | **85.0%**（51/60）|
+| 达到 closed | 83% | 85% |
+| 进入 closing | 93% | 93% |
+| `verify_grasp_success_criterion` | PASS | PASS |
+
+方案①（环境机制）旧模型即受益；方案②（奖励）需重训后体现——预期重训后成功率再提升。
+
+---
+
+### 背景
+用户观察：成功 episode 显示 200/218 步（含抬升 ~28 步），要求"训练步数只计数到成功抓取，抬升不计入"。
+分析：
+- `max_steps=200` 预算已只算抓取前步数（P4 设计，`pre_lift_steps`）✓
+- 但 **Monitor/tensorboard 的 ep_len 统计含抬升**（成功跑到 lift_done 才 terminated）→ 218 步
+
+### 改动
+| 位置 | 内容 |
+|---|---|
+| `config.py` | 新增 `lift_enabled: bool = False`（默认关闭抬升）|
+| `environment.py` | 抬升触发条件加 `getattr(lift_enabled, False)`——关闭时成功当步走 `_is_done` 旧逻辑 `is_grasped → True`，episode 结束 |
+
+### 验证（PPO_93 模型 + 新环境，60 episodes）
+| 指标 | 之前（含抬升）| 现在 |
+|---|---|---|
+| 成功率 | 81.7% | **83.3%**（50/60）|
+| 成功 episode 步数 | ~190-218 | **44-64 步**（不含抬升）|
+| 进入 closing | 93% | 93% |
+| `verify_grasp_success_criterion` | PASS | PASS |
+
+### 意义
+- tensorboard `ep_len` 反映真实抓取步数（~50 步），不再被抬升混淆
+- 训练 `total_timesteps` 不再浪费在抬升上（每个成功 episode 省 ~28 步）
+- P4 抬升代码保留，`lift_enabled=True` 可恢复（部署/验证抬升稳定性用）
+
+---
+
+### 背景
+PPO_92（~500k 步）训练内成功率 5.78%、独立评估 16.7%——大幅进步但仍低。
+评估显示：**进入 closing 100%（到达已完全学会），但 closing→closed 仅 18.3%**——
+pad 能到触发区（XY<3cm），但停的位置差 1-2cm（cube 半宽 2cm），手指合拢夹不住。
+
+### 改动
+| 位置 | 内容 |
+|---|---|
+| `config.py` | 新增 `closing_align_tol=0.005`（偏差<5mm 保持）、`closing_align_speed=0.02`（限速 0.02m/s≈每步0.8mm） |
+| `environment.py` | closing 阶段由"静止"改为"向 cube 中心 XY 缓慢微调到位后保持"（限速防撞飞 cube） |
+
+### 验证（PPO_92 模型 + 新环境，60 episodes）
+| 指标 | 方案B（静止）| 方案B+2（微调）|
+|---|---|---|
+| 成功率 | 16.7% | **53.3%**（32/60）|
+| closing→closed | 18.3% | **56.7%**（34/60）|
+| 进入 closing | 100% | 100% |
+
+### 意义
+方案2 把"精确对齐"从策略职责移入环境状态机（类似 lift 宏）——策略只需到达触发区，
+对齐+闭合由状态机完成。**sim-to-real 提示**：部署实机时需在控制器层实现同样的
+"触发后自动对齐再合拢"逻辑。
+
+### 下一步
+重训（策略将适配微调机制，进入 closing 即接近成功）→ 预期成功率再上台阶。
+
+---
 
 ### 背景
 PPO_90（惩罚调整后，200k 步）奖励转正（+2.78）、接触率 50%，但仍 0 成功。

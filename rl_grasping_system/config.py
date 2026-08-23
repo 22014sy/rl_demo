@@ -76,6 +76,10 @@ class GraspingConfig:
                                            # 4.5cm 即 pad 在 cube 表面外 2.5cm（cube 半宽 2cm），手指合拢夹不到；
                                            # 收紧到 3cm 保证 pad 几乎正对 cube 中心（手指能包住物体）。
     grasp_align_z_tol: float = 0.032      # Z 对齐阈值（受 home 假成功约束：pad 距 cube 0.034，须 <0.034）
+    # 方案2(2026-08-22): closing 阶段 pad 向 cube 中心 XY 缓慢微调（解决 PPO_92 卡点：
+    # 进入 closing 100% 但 closing→closed 仅 18.3%——pad 停的位置差 1-2cm 手指夹不住）
+    closing_align_tol: float = 0.005      # 偏差 < 该值(m) 即保持不动（5mm 内手指已能夹住）
+    closing_align_speed: float = 0.02     # 微调限速 (m/s)，每决策步 ~0.8mm，避免挤压撞飞 cube
     # Task3 冲击抑制（见 docs/抓取冲击抑制方案.md）：
     approach_speed_limit: float = 0.12    # pad 距 cube < approach_speed_dist 时末端线速度限幅 (m/s)（对应实机 UR 慢速 Servo 接近）
     approach_speed_dist: float = 0.06     # 接近限速触发距离（pad 中心→cube；仅抓取最后一段限速，避免 home 全程触发）
@@ -95,6 +99,9 @@ class GraspingConfig:
     # 降到 0.003 后（实测 3 个 seed 稳定）：立方体 100.0% 刚性跟随、宽度恒 0.0345 不滑脱，
     # ~494 步 EE 到位 0.2m（obj 同步抬 ~0.185m = 0.2-lift_tol）。
     # max_steps 只计抬升前步数（见 environment），抬升步数不消耗 RL 预算。
+    lift_enabled: bool = False     # 2026-08-23: 抬升默认关闭——成功抓取当步 episode 即结束，
+                                   # 训练步数只计数到成功抓取，抬升不计入（tensorboard ep_len 干净，
+                                   # 不再显示 218 步含抬升）。部署/验证需要抬升时设 True（P4 逻辑保留）
     lift_height: float = 0.2       # 抬升总高度 (m)
     lift_speed: float = 0.003      # 每步抬升增量上限 (m/step)：0.005 有 ~6% 滞后，0.003 物体 100% 跟随
     lift_tol: float = 0.015        # 到达目标高度的容差 (m)
@@ -133,7 +140,7 @@ class NetworkConfig:
 class TrainingConfig:
     """训练配置"""
     # 基本参数
-    total_timesteps: int = 500000  # 并行改造(2026-08-22): 40000→200000。A2(40k 步/136ep) 成功率仅 5.1%，样本量是成功率低的根因之一；配合 12 环境并行，墙钟时间反而更短
+    total_timesteps: int = 1000000  # 并行改造(2026-08-22): 40000→200000。A2(40k 步/136ep) 成功率仅 5.1%，样本量是成功率低的根因之一；配合 12 环境并行，墙钟时间反而更短
     learning_rate: float = 2e-4     # 适中的学习率
     batch_size: int = 1024          # 与n_steps匹配，避免警告
     n_steps: int = 2048          # 并行改造(2026-08-22): 1024→2048（12 环境并行，每 worker 每 rollout 跑 ~171 步；batch_size 1024 不变）
@@ -155,7 +162,9 @@ class TrainingConfig:
     norm_reward_clip: float = 10.0  # 奖励归一化裁剪
     
     # 训练控制
-    save_freq: int = 50000          # 检查点保存频率（仅当 train(save_path=...) 时生效）
+    save_freq: int = 98304          # 检查点保存频率（2026-08-23: 50000→98304。SB3 CheckpointCallback 要求
+                                    # save_freq 是 n_steps×n_envs(2048×12=24576) 的倍数，否则永不触发；
+                                    # 98304 = 4 个 rollout ≈ 每 ~4 分钟存一个 checkpoint，崩溃最多损失 4 分钟）
     # 早停条件 - 放宽条件
     success_threshold: float = 0.6   # 降低成功率阈值 (原0.8)
     patience: int = 50              # 增加耐心值 (原30)
@@ -192,6 +201,10 @@ class RewardConfig:
 
     # --- 接触（真实物理接触）---
     w_contact: float = 5.0            # 手指接触物体奖励
+    # 方案②(2026-08-23): 进入 closing 相位（pad 到达闭合触发区）的中间奖励——激励策略
+    # 把 pad 从"触发区边缘(4cm)"精确推到"正中心(3cm内)"（PPO_93 失败分析：4/10 未进 closing，
+    # pad-cube XY 差 0.6-2.1cm；closing 是抓取的中间里程碑，此前无中间信号，grasp_reward 太稀疏）
+    close_trigger_reward: float = 5.0
     contact_force_threshold: float = 0.1  # 接触判定阈值(N)
 
     # --- 抓取事件 ---

@@ -424,12 +424,30 @@ class GraspingEnv(gym.Env):
                     and not self.task_state.get('lift_aborted')):
                 v_z = float(getattr(self.grasping_config, 'lift_speed', 0.01)) / T
                 self._vel_target = np.array([0.0, 0.0, v_z, 0.0, 0.0, 0.0])
-            # 方案B(2026-08-22): closing 阶段覆盖 RL 动作为静止——pad 停住让手指自然合拢。
-            # PPO_90 实证：closing 期间策略持续移动 pad + 手指快速合拢（宽度 ~0.01/步 > close_width_tol 0.004）
-            # 导致"连续 3 步宽度收敛"判定永不满足 → 宽度降到 <grasp_min_width → 空闭合回退。
-            # closing 与 lift 不会同时出现（lift 需 grasp_success=closed 之后）。
+            # 方案B+2(2026-08-22): closing 阶段覆盖 RL 动作——pad 向 cube 中心 XY 缓慢微调到位后保持。
+            # 方案B（静止）实证解决"策略不停手→宽度不收敛→空闭合"（PPO_90 卡点）；
+            # 方案2（微调）解决"pad 停的位置差 1-2cm 手指夹不到"（PPO_92 卡点：进入 closing 100%
+            # 但 closing→closed 仅 18.3%，cube 半宽 2cm）。
+            # 微调限速 closing_align_speed（0.02m/s = 每决策步 ~0.8mm），偏差 < closing_align_tol 即保持，
+            # 避免挤压撞飞 cube。closing 与 lift 不会同时出现（lift 需 grasp_success=closed 之后）。
             if self.gripper_phase == 'closing':
-                self._vel_target = np.zeros(6)
+                _gc = (self.data.site_xpos[self.pad_site_left_id]
+                       + self.data.site_xpos[self.pad_site_right_id]) / 2.0
+                _obj = self._get_object_position()
+                _err = _obj[:2] - _gc[:2]
+                _z_err = _obj[2] - _gc[2]   # 方案①(2026-08-23): Z 对齐——pad 悬空时微降到接触高度
+                _tol = float(getattr(self.grasping_config, 'closing_align_tol', 0.005))
+                _tol_z = float(getattr(self.grasping_config, 'closing_align_z_tol', 0.003))
+                _v = float(getattr(self.grasping_config, 'closing_align_speed', 0.02))
+                _v_target = np.zeros(6)
+                if np.linalg.norm(_err) > _tol:
+                    _v_target[:2] = np.clip(_err / T, -_v, _v)
+                # 方案①: pad 未接触 cube 时 Z 微降（解决 PPO_93 失败模式2：进 closing 但 pad 悬空
+                # 在 cube 顶面上方 ~1cm，手指合拢碰不到 → 空闭合）；已接触则保持
+                _cf = self._get_grasp_contact_force()
+                if abs(_z_err) > _tol_z and _cf < 0.1:
+                    _v_target[2] = np.clip(_z_err / T, -_v, _v)
+                self._vel_target = _v_target
         else:
             # 位置模式（旧行为）：DLS IK -> 位置伺服目标（仅对 position-servo 型 XML 有效）
             safe_action = self.action_wrapper.apply(action, current_state)
@@ -524,13 +542,17 @@ class GraspingEnv(gym.Env):
         
         # P3: 夹爪自动闭合状态机 + 抓取成功判定
         was_grasped = self.task_state['grasp_success']
+        prev_phase = self.gripper_phase  # 方案②(2026-08-23): 记录上一相位，检测 closing 上升沿
         self._update_gripper_state()
 
         # P4: 抬升阶段推进——抓取成功即开始抬升；每步计数 + 到位判定
+        # 2026-08-23: 受 lift_enabled 控制（默认 False 不抬升——成功当步 episode 结束，
+        # 训练步数只计到成功抓取；部署/验证需要抬升验证时设 True）
         if (self.task_state['grasp_success']
                 and not self.task_state.get('lift_active')
                 and not self.task_state.get('lift_done')
                 and not self.task_state.get('lift_aborted')
+                and float(getattr(self.grasping_config, 'lift_enabled', False))
                 and float(getattr(self.grasping_config, 'lift_height', 0.0)) > 0.0):
             ee = self._get_end_effector_position()
             self.task_state['lift_active'] = True
@@ -557,6 +579,8 @@ class GraspingEnv(gym.Env):
             # P4: 成功上升沿 + 抬升阶段标志——奖励只在成功当步一次性发放，
             # 抬升期间 grasp_success 持续为 True，若仍按电平式发放会重复累加事件奖励
             'grasp_success_rising': bool(self.task_state['grasp_success'] and not was_grasped),
+            # 方案②(2026-08-23): 进入 closing 上升沿——中间里程碑奖励（激励 pad 精确对齐到触发区）
+            'closing_rising': bool(self.gripper_phase == 'closing' and prev_phase != 'closing'),
             'lift_active': bool(self.task_state.get('lift_active', False)),
             'contact_force': contact_force,
         }

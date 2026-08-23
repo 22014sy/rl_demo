@@ -67,7 +67,7 @@ def orientation_align(q_hand, q_target):
 # 放在返回值 b['diag'] 里，**绝不进入奖励**（P1.3 修复：此前 sum(values()) 把
 # orient_align、z_axis_z 也算进奖励，而 z_axis_z=“手指朝上+1/朝下−1”，等于把 P1.2
 # 修复掉的反向信号以系数 1 重新注入奖励——这正是方向项修了却不见效的原因之一）。
-REWARD_KEYS = ('r_dist_xy', 'r_dist_z', 'r_orient', 'r_contact', 'r_grasp', 'r_success', 'r_step')
+REWARD_KEYS = ('r_dist_xy', 'r_dist_z', 'r_orient', 'r_contact', 'r_close', 'r_grasp', 'r_success', 'r_step')
 
 
 def _anchor_boost(w, d, d_target):
@@ -181,17 +181,22 @@ def reward_breakdown(state, prev_state, grasp_info, reward_config=None):
     contact_force = float(grasp_info.get('contact_force', 0.0))
     rising = grasp_info.get('grasp_success_rising', None)
     lift_active = bool(grasp_info.get('lift_active', False))
+    # 方案②(2026-08-23): 进入 closing 相位（pad 到达闭合触发区）上升沿——中间里程碑奖励
+    closing_rising = bool(grasp_info.get('closing_rising', False))
     if rising is None:
         # 诊断/单状态调用：无上升沿标志 -> 电平式（每次调用独立，保持 P3 行为）
         parts['r_contact'] = reward_config.w_contact if contact_force >= reward_config.contact_force_threshold else 0.0
+        parts['r_close'] = 0.0
         parts['r_grasp'] = reward_config.grasp_reward if grasp_info.get('is_grasped', False) else 0.0
         parts['r_success'] = reward_config.completion_reward if grasp_info.get('grasp_success', False) else 0.0
     elif lift_active and not rising:
         # P4: 抬升阶段——任务已交给自动状态机，事件奖励不再重复发放；
         # 位置/方向塑形冻结（抬升由状态机执行，不该因"远离 pre-grasp 目标"被惩罚）
         parts['r_contact'] = 0.0
+        parts['r_close'] = 0.0
         parts['r_grasp'] = 0.0
         parts['r_success'] = 0.0
+        parts['r_step'] = 0.0  # 2026-08-23: 抬升不计入训练步数，也不扣步惩罚（一致性）
         if prev_state is not None:
             parts['r_dist_xy'] = 0.0
             parts['r_dist_z'] = 0.0
@@ -200,6 +205,7 @@ def reward_breakdown(state, prev_state, grasp_info, reward_config=None):
         # 训练普通步：接触为电平式（接近阶段鼓励碰到物体）；
         # 抓取/成功只在 grasp_success 上升沿一次性发放（成功当步 rising=True）
         parts['r_contact'] = reward_config.w_contact if contact_force >= reward_config.contact_force_threshold else 0.0
+        parts['r_close'] = reward_config.close_trigger_reward if closing_rising else 0.0
         parts['r_grasp'] = reward_config.grasp_reward if rising else 0.0
         parts['r_success'] = reward_config.completion_reward if rising else 0.0
     parts['r_step'] = -reward_config.step_penalty
