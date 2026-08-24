@@ -320,10 +320,15 @@ class GraspingAgent:
             # 2026-08-23 迁移学习恢复 VecNormalize 观测统计：若存在 <model>_vecnormalize.pkl，
             # 先恢复 obs_rms/ret_rms，否则迁移初期观测归一化失配（stats 为初始值），
             # 策略输出与训练时不一致，fine-tune 慢甚至失败。
+            # 2026-08-24 修复：VecNormalize.load 的 venv 参数必须传底层 VecEnv（vec_env.venv），
+            # 不能传 VecNormalize 实例本身——否则 load 后出现 "VecNormalize 嵌套 VecNormalize"，
+            # vn.venv.reset()/step() 实际调用内层 VecNormalize 的归一化逻辑，
+            # 返回异常（近全 0 / 双重归一化）观测 → 训练 rollout 观测错误 → 迁移训练成功率恒 0%。
             _norm_pkl = os.path.splitext(self.model_path)[0] + "_vecnormalize.pkl"
             if os.path.exists(_norm_pkl):
-                vec_env = VecNormalize.load(_norm_pkl, vec_env)
-                logger.info(f"迁移学习：已恢复 VecNormalize 观测统计 {_norm_pkl}")
+                _base = vec_env.venv if isinstance(vec_env, VecNormalize) else vec_env
+                vec_env = VecNormalize.load(_norm_pkl, _base)
+                logger.info(f"迁移学习：已恢复 VecNormalize 观测统计 {_norm_pkl}（venv={type(_base).__name__}）")
             self.agent = PPO.load(self.model_path, env=vec_env)
             logger.info(f"加载预训练模型: {self.model_path}")
 
@@ -370,7 +375,10 @@ class GraspingAgent:
             checkpoint_callback = CheckpointCallback(
                 save_freq=max(int(self.training_config.save_freq) // _n_envs, 1),
                 save_path=os.path.dirname(save_path),
-                name_prefix=os.path.basename(save_path).replace('.zip', '')
+                name_prefix=os.path.basename(save_path).replace('.zip', ''),
+                # 2026-08-24: 连带保存 VecNormalize 观测统计（否则 checkpoint 无 pkl，
+                # 崩溃恢复/续训时观测归一化失配 → 迁移/续训成功率暴跌）
+                save_vecnormalize=True,
             )
             callbacks.append(checkpoint_callback)
 

@@ -58,7 +58,8 @@ def load_model(model_path: str, config):
     logger.info(f"模型加载成功: {model_path}")
     return agent, env
 
-def run_episode(agent, env, render: bool = False, max_steps: int = 500):
+def run_episode(agent, env, render: bool = False, max_steps: int = 500,
+                deterministic: bool = True):
     """运行单个episode"""
     obs, _ = env.reset()
     episode_reward = 0
@@ -66,8 +67,8 @@ def run_episode(agent, env, render: bool = False, max_steps: int = 500):
     episode_info = []
     
     while episode_length < max_steps:
-        # 预测动作
-        action, _ = agent.predict(obs, deterministic=True)
+        # 预测动作（2026-08-24：加 deterministic 参数，供位置迁移诊断测量随机策略成功率）
+        action, _ = agent.predict(obs, deterministic=deterministic)
         
         # 执行动作
         obs, reward, terminated, truncated, info = env.step(action)

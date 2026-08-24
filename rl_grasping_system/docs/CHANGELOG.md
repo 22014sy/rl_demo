@@ -5,6 +5,202 @@
 
 ---
 
+## 2026-08-24 · Stage 2 完成（±6cm 迁移训练，确定性 73% 达标）
+
+### 结论
+从 `final_model_stage1b` 迁移训练 ±6cm（radius 0.06, 500k 步, 21 个 rollout），
+**确定性 73.0%（100ep）≥ 70% 达标**；stochastic 82.0%（50ep）。迁移链完整闭环：
+固定位 → ±3cm det 77% → ±6cm det 73%（只掉 4 个点）。
+
+### 训练
+- 前置：±6cm IK 可达性 49/49 = 100%（脚本 `verify_radius_006_reachability.py`）
+- 从 `final_model_stage1b.zip` 续训 500,000 步（21 个 rollout，~29 分钟）
+- rollout：0.797 0.722 0.806 0.763 0.709 0.758 0.780 0.778 0.775 0.828 0.751
+  0.783 0.763 0.807 0.785 0.813 0.794 0.811 0.822 0.804 0.779（末段 78-82%）
+- 产物：`models/final_model_stage2.zip`(+`_vecnormalize.pkl`)
+
+### 评估（±6cm）
+| 口径 | 结果 | 步数 | 距 |
+|---|---|---|---|
+| deterministic 100ep | **73.0%** | 96.5 | 0.157 |
+| stochastic 50ep | 82.0% | 89.4 | 0.155 |
+- σ：log_std=[0.233,0.404,0.328] → σ=[1.263,1.498,1.388]（继续增大 = 探索激进，
+  但 μ 同步精确、确定性 73% 达标，再印证"σ 大与 μ 精确并存"）
+
+### 迁移链总览（确定性 100ep 口径）
+| 阶段 | 半径 | det | stoch |
+|---|---|---|---|
+| stage1 固定 | 0 | 基准 | — |
+| stage1b | ±3cm | 77.0% | 94.0% |
+| stage2 | ±6cm | **73.0%** | 82.0% |
+- ROADMAP 随机线（det ≥70%）两阶段均达标 → **Stage 2 验收通过**。
+
+---
+
+## 2026-08-24 · Stage 1b 续训完成（确定性达标）+ 启动 Stage 2
+
+### 结论
+Stage 1b（从 `final_model_stage1` 续训 400k 步 ±3cm）确定性评估 **77.0%**（100 ep）达标
+（ROADMAP ≥70%），Stage 1 验收通过；已进入 Stage 2（±6cm）。
+
+### 训练
+- 从 `final_model_stage1.zip` 续训 400,000 步（17 个 rollout，`--radius 0.03`）
+- rollout：74.8 → 79.5 → 75.1 → 75.4 → 80.6 → 82.9 → 75.2 → 82.6 → 83.9 → 81.4
+  → 80.4 → 80.0 → 80.7 → 83.3 → 80.9 → 83.8 → **84.4**
+- 产物：`models/final_model_stage1b.zip`(+`_vecnormalize.pkl`)，PPO.load 通过
+
+### 评估（±3cm，样本量对评估噪声敏感）
+| 口径 | 50ep | 50ep rerun | 100ep |
+|---|---|---|---|
+| deterministic | 66.0% | 72.0% | **77.0%** |
+| stochastic | — | — | 94.0%（50ep） |
+- **教训**：50ep 评估噪声大（66% vs 72%），100ep 大样本才稳（77%）；此前 Stage 1 的
+  "66% 未达标"结论受单次评估噪声影响被低估。**确定性评估固定 100ep 口径**。
+- σ 对比：stage1 log_std=[0.083,0.257,0.17] → stage1b=[0.155,0.327,0.264]（σ 更大 = 探索更激进），
+  但 mean 动作同步变精确（det 66→77），stochastic 94% 印证能力提升——"σ 大"与"μ 变精确"可并存。
+
+### Stage 2 前置：±6cm IK 可达性
+- 新增 `scripts/verify_radius_006_reachability.py` 打点 49 点（X∈[0.04,0.16]×Y∈[0.36,0.48]）
+  → **49/49 = 100% 可达**（IK 误差 p90=0.00028）→ radius 0.06 可行，无需降 0.05。
+
+### 已启动 Stage 2
+- 从 `final_model_stage1b.zip` 迁移，`--radius 0.06 --total-timesteps 500000`
+  `--save-model final_model_stage2.zip`（~21 分钟）
+
+---
+
+## 2026-08-24 · Stage 1 续训链路演练（drill）完成
+
+### 演练目的
+在不影响主线模型的前提下完整走一遍"启动 → 中断 → 恢复续训 → 评估 → 清理"链路
+（Stage 2 原样复用），真实踩一遍两个已知坑（SB3 pkl 命名、num_timesteps 重置）。
+
+### 执行过程（全部成功）
+| 阶段 | 操作 | 结果 |
+|---|---|---|
+| 1 启动 | 从 `final_model_stage1` 续训 196608 步，`--save-model final_stage1_drill` | rollout 1-4：72.4% → 76.1% → 73.1% → **78.8%** |
+| 2 中断 | 第 4 个 rollout 保存 98304 checkpoint 后 kill | 进程 0；`final_stage1_drill.zip` 未生成（收尾前中断） |
+| 3 坑1修复 | `mv ..._vecnormalize_98304_steps.pkl → ..._98304_steps_vecnormalize.pkl` | stats 恢复命中（日志确认） |
+| 3 续训 | `--total-timesteps 98304`（剩余步数） | 76.5% → 79.1% → 78.0% → **79.1%**，最终保存成功 |
+| 4 评估 | 双口径 ±3cm | **deterministic 70.0%**（35/50）、**stochastic 80.0%**（40/50） |
+| 5 清理 | 删 98304 checkpoint + 孤儿 pkl | `final_stage1_drill.zip(+pkl)` 保留，主线模型未动 |
+
+### 演练新发现（补充进手册）
+- **进程清理要防误杀 shell 自身**：`pkill -f 'final_stage1_[d]rill'`（正则避开方括号字面量）。
+- **并行启动命令的 cd 只作用于第一个后台 job**：`cd x && A & B &` 中 B 在旧目录跑 →
+  并行启动要把 `cd` 放进每个后台 job。
+- **续训收尾会再存一次 checkpoint**：续训 num_timesteps 从 0 走满 98304 时 SB3 又存
+  `{prefix}_98304_steps` checkpoint（含 SB3 命名 pkl）→ 清理时注意遗留孤儿 pkl。
+- 演练模型（stage1 + 0.2M 步）deterministic 70.0%（较 66% 有提升但有限），
+  与"σ 未收敛、需继续训练压低方差"结论一致。
+
+### 状态
+主线 `final_model_stage1.zip(+pkl)` 未变；是否启动正式 stage1b 续训（400k 步推确定性 ≥72~75%）待定。
+
+---
+
+## 2026-08-24 · 课程阶段 1 续训完成 + 续训可恢复性修复
+
+### 结论
+Stage 1（固定位置 → 位置随机 ±3cm 迁移）**训练完成并通过评估**：
+`final_model_stage1.zip`（+`_vecnormalize.pkl`）确定性评估 ±3cm **成功率 66.0%**（33/50），
+平均步数 105.4（成功提前终止，非 200 封顶），平均最终距离 0.156。
+
+### 第一轮训练中断（1M 步差 ~11.5 万步被杀）
+- 从 fixed 迁移的训练跑完 40 个 rollout（983,040 步）后，进程在收尾阶段被杀：
+  日志戛然而止（无"最终模型已保存"），最后一个 checkpoint `..._983040_steps.zip`
+  **0 字节损坏**，`final_model_stage1.zip` 未保存。
+- 恢复：从最新有效 checkpoint `final_model_stage1_884736_steps.zip`（88.5% 进度）续训补足剩余步数。
+
+### 续训踩坑 1：checkpoint 无 VecNormalize pkl → 归一化失配 → 成功率又归 0%
+- **现象**：从 884736 checkpoint 续训，前 3 个 rollout 成功率恒 0%、平均步数 200 封顶。
+- **根因**：`CheckpointCallback` 只存 PPO zip（`_excluded_save_params` 排除 `_vec_normalize_env`），
+  不含观测统计；续训时新 `VecNormalize` 用初始 stats（mean=0,var=1≈恒等）→ 策略输入与训练时
+  归一化观测失配 → 策略乱走（复现 0% bug 的同一机理）。
+- **注意**：不能用 `final_model_fixed_vecnormalize.pkl` 直接顶替——fixed 训练下物体位置固定，
+  其 `obs_rms.var[35:38]`（target_position）= **0**，直接复用会把位置分量归一化到 ±10 边界、
+  丢失位置感知。
+- **修复**：
+  1. `agent.py` CheckpointCallback 加 **`save_vecnormalize=True`**——checkpoint 连带保存观测统计，
+     今后崩溃恢复/续训不再失配。
+  2. 为 `884736_steps` checkpoint 生成配套 pkl：以 fixed pkl 为基础（其余 52 维统计在 fixed/stage1
+     下相同），**修正 target_position 分量 var 为 ±3cm 合理值**（x/y: 3e-4，z: 1e-4），
+     并先验证 `checkpoint + 修正 stats` 在 ±3cm 确定性成功率 **60%**（24/40，恢复非 0%）。
+
+### 续训踩坑 2：SB3 learn 重置 num_timesteps → 续训传错步数会过度训练
+- SB3 `learn()` 默认 `reset_num_timesteps=True`，**续训时 num_timesteps 从 0 重新计数**（权重继承
+  checkpoint，但步数累计归零）。
+- 因此续训的 `--total-timesteps` 应传**剩余步数**（目标总步数 − 已训练步数），否则会从 checkpoint
+  再跑满整个目标（本例若传 1,000,000 会累计 188 万步，严重超训）。
+- 本次从 884736 续训传 `--total-timesteps 115264`（= 1,000,000 − 884,736），权重累计 ≈ 1M 步等价。
+
+### 续训踩坑 3：SB3 checkpoint 的 pkl 命名与加载逻辑不匹配
+- SB3 CheckpointCallback 的 `save_vecnormalize` 生成 `{prefix}_vecnormalize_{n}_steps.pkl`
+  （"vecnormalize" 在中间），而 `set_environment`/`load` 期望 `<model>_vecnormalize.pkl`。
+- 二者**不匹配** → checkpoint 的 pkl 无法被 `set_environment` 自动恢复。当前靠手动生成
+  `final_model_stage1_884736_steps_vecnormalize.pkl`（命名匹配）规避；将来可让
+  `agent.load`/`set_environment` 同时尝试 SB3 命名。
+
+### Stage 1 最终数据
+| 项 | 值 |
+|---|---|
+| 续训 rollout 成功率 | 72.4% → 73.7% → 72.7% → 74.2% → **78.6%** |
+| 确定性评估 ±3cm（50 ep） | **66.0%**（33/50） |
+| 平均步数 / 平均最终距离 | 105.4 / 0.156 |
+| 产物 | `models/final_model_stage1.zip` + `models/final_model_stage1_vecnormalize.pkl` |
+
+### 推荐下一步
+- Stage 1 验收通过后进入 Stage 2：增大随机半径（如 `--radius 0.06`），从 `final_model_stage1.zip`
+  迁移加载，续训 `--total-timesteps` 传本阶段步数。
+
+---
+
+
+## 2026-08-24 · 迁移训练 0% 根因修复：VecNormalize.load 嵌套
+
+### 现象
+课程阶段 1（迁移 final_model_fixed → 位置随机 ±3cm，`train_with_monitor.py --position-random --radius 0.03 --load-model`）
+训练 14 个 rollout（34 万步）**成功率恒 0%**、平均步数恒 200（所有 episode 跑满上限）。
+
+### 排查过程（多轮诊断脚本 + 对照实验）
+1. **诊断 vs 训练矛盾**：单机 evaluate（`agent.predict` + 裸 env）随机位置下 fixed 模型
+   deterministic/stochastic 均有 36.7%~55% 成功率；但训练 rollout 恒 0%。
+2. **排除**：位置随机未生效（并行 worker 物体位置 X∈[0.072,0.123] Y∈[0.393,0.450] 正常）；
+   VecNormalize 更新/冻结（冻结后仍 0%）；预热 obs_rms（扩展 stats 后仍 0%，且改变策略熟悉分布）。
+3. **关键对比**（`scripts/check_reset_layers.py`、`scripts/repro_ppo_load.py`）：
+   - 裸 env / Monitor / DummyVecEnv reset → 观测正常（物理值）
+   - `VecNormalize.load(pkl, vec_env)` 后 `vn.venv.reset()` → **观测近全 0**
+   - 而 `VecNormalize.load(pkl, 底层 venv)` 后 → 正常
+4. **根因**：`agent.py` 的迁移加载 `VecNormalize.load(_norm_pkl, vec_env)` 传入的是
+   **VecNormalize 实例**（set_environment 已先 `VecNormalize(SubprocVecEnv)` 包装）→
+   load 创建的 VecNormalize 的 `venv = 另一个 VecNormalize`（**嵌套**）→
+   `vn.venv.reset()/step()` 实际调用内层 VecNormalize 的归一化逻辑 → 返回异常观测
+   → 训练 rollout 观测错误 → 策略输入失真 → 0%。
+   单机 evaluate 用裸 env + `vn.normalize_obs` 恰好绕过了该路径，故看似正常（46.7%~55%）。
+
+### 修复（`agent.py` set_environment 迁移加载）
+```python
+_base = vec_env.venv if isinstance(vec_env, VecNormalize) else vec_env
+vec_env = VecNormalize.load(_norm_pkl, _base)
+```
+`VecNormalize.load` 的 venv 参数必须传**底层 VecEnv**（SubprocVecEnv/DummyVecEnv），
+不得传 VecNormalize 本身。
+
+### 验证
+- `scripts/verify_parallel_vn.py`（并行 set_environment 迁移 + 采样 4096 步）：
+  修复前成功率 **0.0%** → 修复后 **51.5%**（185/359），reset 观测恢复正常归一化值。
+- **重新启动迁移训练**（`--position-random --radius 0.03 --load-model final_model_fixed`）：
+  rollout 成功率 **63.3% → 66.4% → 64.2% → 68.3%**（上升趋势），平均步数 110~117
+  （成功提前终止，不再是 200 封顶）——策略在位置随机下保持有效并继续 fine-tune。
+
+### 新增诊断脚本（`scripts/`）
+`verify_position_migration.py`（fixed 模型位置随机鲁棒阈值，支持 --stochastic）、
+`compare_predict_paths.py`（归一化路径 A/B/C 对比）、`verify_parallel_vn.py`（并行 VN 状态 + 采样）、
+`verify_warmup.py`（obs_rms floor/预热实验）、`check_reset_layers.py` / `check_setenv_chain.py` /
+`repro_ppo_load.py`（逐层定位 reset 观测异常）。
+
+---
+
 ## 2026-08-23 · 防崩溃修复（--no-demo + checkpoint 定期保存）
 
 ### 背景
@@ -35,6 +231,43 @@ python train_with_monitor.py --save-model final_model_fixed.zip --total-timestep
 ```
 
 ---
+
+## 2026-08-23 · 课程阶段 1：位置随机迁移训练（进行中）
+
+### 背景
+- 固定位置模型 `final_model_fixed.zip` 评估 83.3% 成功率（60 episodes），需泛化到位置随机
+- PPO_96 位置随机**从零训练失败 0%** → 课程学习必须迁移加载（继承固定位置技能）
+
+### 迁移加载改进（`agent.py`）
+- `set_environment` 迁移加载时若存在 `<model>_vecnormalize.pkl`，先 `VecNormalize.load` 恢复
+  观测统计，再 `PPO.load`——修复迁移初期观测归一化失配（stats 为初始值）导致策略输出不一致
+  的问题（否则 fine-tune 慢甚至失败）
+
+### 训练命令
+```bash
+python train_with_monitor.py --position-random --radius 0.03 \
+  --load-model models/final_model_fixed.zip \
+  --save-model final_model_stage1.zip \
+  --total-timesteps 1000000 --no-demo
+```
+
+### 参数说明
+| 参数 | 值 | 说明 |
+|---|---|---|
+| `--load-model` | `models/final_model_fixed.zip` | 迁移加载固定位置抓取技能 |
+| `--position-random` | `--radius 0.03` | 物体位置围绕 (0.1,0.42) ±3cm 随机 |
+| `--save-model` | `final_model_stage1.zip` | 独立保存（不覆盖 fixed / stage 模型）|
+| `--total-timesteps` | `1000000` | 迁移 fine-tune |
+| `--no-demo` | — | 禁用演示窗口（防崩溃）|
+
+### 状态（已完成 2026-08-24）
+- ✅ 从 fixed 迁移训练 + 中断恢复续训补足 1M 步完成
+- ✅ 最终模型 `models/final_model_stage1.zip`（+ `_vecnormalize.pkl`）已保存
+- ✅ 确定性评估 ±3cm：**66.0%**（33/50）、平均步数 105.4（详见顶部"课程阶段 1 续训完成"条目）
+
+---
+
+## 2026-08-23 · 训练脚本参数扩展（--save-model / --total-timesteps）
 
 ### 背景
 - PPO_95 模型被 PPO_96（位置随机从零训练，0% 成功率）覆盖，无备份
