@@ -45,8 +45,11 @@ def main():
     for i in range(0, obs.shape[0] - 2):
         if np.allclose(obs[i:i+3], tp, atol=1e-3):
             print(f">>> 物体位置 {np.round(tp,4)} 出现在观测 index {i}")
-    # 检查 q_rel 段（末尾 4）
-    print(f"obs[-5:]={np.round(obs[-5:],4)}")
+    # D1（2026-08-24，观测空间 55→67，最终形态）：q_rel 段 [50:54] + grasp_phase(54)
+    # + 标称参考速度 [55:61] + 障碍相对位姿 [61:64] + 障碍速度 [64:67]
+    print(f"q_rel[50:54]={np.round(obs[50:54],4)}  grasp_phase(54)={obs[54]:.2f}")
+    print(f"v_nominal[55:61]={np.round(obs[55:61],4)}")
+    print(f"obstacle_rel[61:64]={np.round(obs[61:64],4)}  obstacle_vel[64:67]={np.round(obs[64:67],4)}")
 
 
 if __name__ == "__main__":

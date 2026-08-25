@@ -5,6 +5,298 @@
 
 ---
 
+## 2026-08-25 · D3 无障碍混合采样 + v6 warm-start 训练（v5→v6 冲线）
+
+### P0 量化 v5 现状（evaluate.py 补训练口径 CLI + 碰撞率/残差统计）
+- **evaluate.py**：新增训练口径 CLI（`--action-mode --obstacle-on-path --obstacle-vel --obstacle-pos
+  --obstacle-w --residual-reg-w --obstacle-mix-ratio --collision-penalty --position-random --radius`）——
+  评估 D2/D3 避障模型必须与训练配置一致（config 默认 delta/无障碍会测错）；默认固定位置
+  （对齐 train_with_monitor 无 `--position-random` 的行为）。
+- **evaluate.py**：新增**碰撞率**（碰撞 episode 比例 + 平均碰撞次数）与**残差幅度 ‖Δv‖**（成功/失败分组，
+  §3.5-5 分工证据）统计；`episode_summaries` 记录每 episode 碰撞数。
+- **environment.py**：`info` 暴露 `residual_norm`（本步 ‖Δv‖，residual 模式真值；delta/position 恒 0）。
+- **v5 实测（200 episodes/口径）**：
+  | 口径 | 成功率 | 平均奖励 | 碰撞率 | 平均碰撞/episode |
+  |---|---|---|---|---|
+  | 固定位置（训练口径） | **74.0%** | +63.2 | **98%** | 45.4 |
+  | 随机 ±3cm（演示口径） | **67.5%** | +52.0 | **99.5%** | 60.5 |
+  → **成功率已过 70% 线，但碰撞率 ~100% 是验收红线**（v5 训练 collision_penalty=0，策略完全不顾碰撞）。
+  残差幅度成功/失败几乎无差（0.2163/0.2162）——v5 每步残差恒定，分工证据不明显。
+  产物：`results/step0_eval_v5_fixed_200.json` / `results/step0_eval_v5_rand003_200.json`。
+
+### P1 无障碍混合采样（一周冲刺方案 §11.4，解决"绕障训练冲刷抓取技能"）
+- **config.py**：`obstacle_mix_ratio: float = 0.0`（每 episode 以该概率隐藏障碍做纯抓取训练）。
+- **environment.py**：per-episode 障碍状态 `_obstacle_active`（reset 按 mix_ratio 采样），
+  全链路替换全局 `self.obstacle_enabled`（激活/观测槽位/接近惩罚/碰撞检测/运动钉住）；
+  隐藏 episode = contype=0 + 观测槽位 0 + obstacle_dist=inf（r_obstacle=0）+ 碰撞计数不触发。
+- **train_with_monitor.py**：`--obstacle-mix-ratio` + `--collision-penalty` + `--collision-max-streak`。
+- **check_d2.py**：新增场景 6（mix=1.0 隐藏/槽位0/inf、mix=0.0 激活、mix=0.5 实测 53/100 激活）；
+  `check_d1` 无回归（5 场景全过）。
+
+### P2 v6 warm-start 训练（v5 → v6，完成 ✅）
+- 命令：`--load-model final_model_stage2_d2_v5.zip --total-timesteps 500000 --action-mode residual
+  --obstacle-on-path --obstacle-w 0.35 --residual-reg 0.3 --obstacle-mix-ratio 0.3 --collision-penalty -2 --no-demo`
+- 参数理由：mix_ratio=0.3 保 30% 纯抓取样本（防 v5 已学技能被绕障样本覆盖）；
+  **collision-penalty=-2 为达成"0 碰撞"验收线的必要信号**——v3 失败的是碰撞**终止**（探索死、episode 25 步），
+  现改为温和**当步惩罚** + 30% 无障碍保底。
+- **CLI 哨兵 bug 修复（关键）**：`--collision-penalty` 用 `>=0` 判"未指定"是错的——合法值是负数，
+  `-2 >= 0` 恒 False → penalty 从未写入 config（首轮 1517 episodes 的 r_collision 全 0，碰撞惩罚形同虚设）。
+  改 `None` 哨兵（`is not None`）后重启，碰撞惩罚确认生效（r_collision 非 0，avg -76.8/episode）。
+- **v6 Step 3 评估（200 episodes/口径，训练同口径 CLI）**：
+  | 口径 | 成功率 | 碰撞率 | 平均碰撞/episode |
+  |---|---|---|---|
+  | 固定位置 | **79.0%** | **65.5%** | 22.9 |
+  | 随机 ±3cm | **75.5%** | **66.5%** | 25.7 |
+  → **成功率达标（≥70%）**；碰撞率 v5→v6 **98%→65.5%**（减半）但仍未到 **0 碰撞**验收线。
+  根因分析：63% 的**成功** episode 仍带碰撞（均 15 次）——`-2×15=-30` vs 成功 +100，**-2 惩罚太弱、碰着也划算**。
+  产物：`results/step3_eval_v6_fixed_200.json` / `results/step3_eval_v6_rand003_200.json`、`models/final_model_stage2_d2_v6.zip`。
+- 日志：`logs/training_log_20260825_155509.json`。
+
+### P3 v7 warm-start 训练（v6 → v7，完成 ❌ 未达标）
+- 命令：`--load-model final_model_stage2_d2_v6.zip --total-timesteps 500000 --action-mode residual
+  --obstacle-on-path --obstacle-w 0.35 --residual-reg 0.3 --obstacle-mix-ratio 0.3 --collision-penalty -5
+  --collision-max-streak 30 --save-model final_model_stage2_d2_v7.zip --no-demo`
+- 参数理由：v6 碰撞率 65.5%（未到 0），根因是 **-2 惩罚太弱**（成功 +100 主导，碰 15 次也只 -30）。
+  v7 加强信号：penalty -5 + max_streak 30（持续碰撞 truncated）。
+- **v7 Step 3 评估（200 episodes/口径，同口径 CLI 含 max-streak 30）**：
+  | 口径 | 成功率 | 碰撞率 | 平均碰撞/episode |
+  |---|---|---|---|
+  | 固定位置 | 69.5% | 64.0% | 14.1 |
+  | 随机 ±3cm | 69.0% | 67.0% | 17.7 |
+  → **未达标**：成功率掉到 70% 线下（69.5%，比 v6 79% 低 10pp），而碰撞率仍 64%（≈v6）。
+  **max_streak 30 伤成功率、对碰撞率无益**（evaluate.py 补 `--collision-max-streak` CLI 对齐评估口径）。
+- 产物：`results/step3_eval_v7_fixed_200.json` / `results/step3_eval_v7_rand003_200.json`、`models/final_model_stage2_d2_v7.zip`。
+
+### 几何诊断（决定 v8 方向）：碰撞率卡 65% 的根因不是惩罚强度
+- **残差恒定**：v5/v6/v7 评估 avg_residual_norm 成功/失败几乎相同（0.2164/0.2162）→ 策略**没有基于障碍观测动态绕障**，
+  学的是"平均路径"直接穿障（惩罚只让它"碰一下快速通过"，碰撞次数 v5 45→v6 23→v7 14 递减但碰撞率不降）。
+- **几何可行**：固定口径探针——障碍球面距 cube 中心 6~8.5cm（cube 半宽 ~2.5cm → **有效绕障间隙 3.5~6cm，0 碰撞可达**）。
+- **根因**：障碍位置固定（on-path fraction=0.5, lateral=0）→ 策略无需根据 obstacle_dist 观测改变动作。
+- **v8 对策**：每-episode 障碍侧偏随机化，强制动态避障。
+
+### P4 v8 warm-start 训练（v6 → v8，完成 ❌ 0 碰撞不可达，交付 v6）
+- 环境改动：config 加 `obstacle_path_lateral_range: (float, float) = (0.0, 0.0)`（默认固定=不破坏 check_d1/d2）；
+  environment reset 在区间非零时随机采样 lateral 再放置障碍；train/evaluate 加 `--obstacle-path-lateral-range "min,max"` CLI。
+  check_d1 ✅ / check_d2 ✅（场景 6 mix 48/100）。
+- 命令：`--load-model final_model_stage2_d2_v6.zip --total-timesteps 500000 --action-mode residual
+  --obstacle-on-path --obstacle-w 0.35 --residual-reg 0.3 --obstacle-mix-ratio 0.3 --collision-penalty -5
+  --obstacle-path-lateral-range=-0.06,0.06 --save-model final_model_stage2_d2_v8.zip --no-demo`
+  （负号开头值必须用等号形式，否则 argparse 当选项报错——已踩坑修正）
+- **v8 Step 3 评估（200 episodes/口径，训练同口径 CLI 含 penalty -5 + 侧偏随机）**：
+  | 口径 | 成功率 | 碰撞率 | 平均碰撞/episode |
+  |---|---|---|---|
+  | 固定障碍 | 70.5% | 66.5% | 19.2 |
+  | 障碍侧偏随机（训练口径） | **73.0%** | **57.0%**（首次 <60%） | 20.3 |
+  | 随机物体 + 障碍侧偏随机 | 65.5% | 53.0% | 19.6 |
+- **决定性探针（模型对障碍观测无响应）**：改 obstacle_rel 槽位 [61:64]（真实/无/近/右/远 5 种），
+  v6 **和** v8 模型输出完全相同 [0.005,0.005,-0.005]（diff=0.00000）→ **策略彻底忽略障碍感知**，残差恒定是真实行为。
+  碰撞率降到 57% 是"障碍偏出路径"的统计效应，不是策略避障。
+- **结论：D3 验收"0 碰撞"在当前 residual PPO 配方下不可达**（4 轮训练 v5→v8 系统性验证：
+  碰撞惩罚把碰撞次数 45→14~23，但碰撞率卡 53~67%；策略无动态绕障）。
+- **交付决策**：**v6 为 D3 正式产物**（成功率最高 79%/75.5% ✅，确定性最好；碰撞 23 次/episode 较 v5 减半）。
+  0 碰撞作为**已知限制**记录：D6 真机评估时碰撞计数需容忍轻度擦碰，或需架构级改进
+  （观测利用/奖励塑造，非参数调优）才能真正绕障。
+
+### P5 v9 从零快速验证（避障感知探路，完成 ✅ 假说成立）
+- 动机：v6/v7/v8 探针铁证——策略**忽略障碍观测**（改 obstacle_rel 槽位输出不变），因 warm-start 锁定
+  "忽略障碍"权重先验（v6 obstacle 输入权重≈0，后续全继承）。从零（无 --load-model）打破先验，
+  让 obstacle 槽位在探索初期就随机影响输出 → 验证 RL 能否激活 obstacle→action 感知。
+- 配置：从零 + `--obstacle-on-path --obstacle-path-lateral-range=-0.06,0.06 --collision-penalty -5
+  --obstacle-w 0.35 --residual-reg 0.3 --obstacle-mix-ratio 0.3 --total-timesteps 300000
+  --save-model final_model_stage2_d2_v9_scratch_300k.zip --no-demo`（侧偏随机 ±6cm 每-episode，
+  障碍观测=预测障碍位置唯一线索）。
+- **结果（验证门通过 ✅）**：
+  - **探针**：改 obstacle_rel 槽位，v9 对"障碍右/远"输出 diff=0.010/0.014（v6/v8=0.00000）→ **障碍感知激活**。
+  - **碰撞率暴跌**：侧偏随机口径 **7.5%**（v6=57%）、固定口径 **22.5%**（v6=65.5%）→ 从零 + 障碍随机
+    确实让 RL 学会利用障碍观测避障（4 轮 warm-start 从未做到）。
+  - **代价**：成功率 0.5%/0.0%（从零 300k 只学完避障、没学完抓取；avg_final_distance 0.69~0.76m）。
+- **结论**：假说成立——**避障学不会的根因 = warm-start 锁定"忽略障碍"权重先验**，不是 RL 原理限制。
+  v9 证明从零 + 障碍随机化能激活避障；下一步续训补齐抓取技能。
+
+### P5.1 v10 续训（v9 → v10，500k，完成 ❌ 但发现关键 bug）
+- 命令：`--load-model final_model_stage2_d2_v9_scratch_300k.zip ... --total-timesteps 500000
+  --save-model final_model_stage2_d2_v10_500k.zip`
+- **关键 bug（19:45 发现）**：`--load-model` 传的是**文件名**（如 `final_model_stage2_d2_v9_scratch_300k.zip`），
+  但 `agent.set_environment` 直接 `os.path.exists(model_path)` **不做 models/ 前缀处理** → 从 cwd 解析失败 →
+  **v10 实际是又一个从零训练，warm-start 从未生效**！v10 与 v9 是两次独立从零训练。
+- v10 结果（从零 500k）：训练成功率 39%（v9=32%）、评估成功率 2%/5%、碰撞率 18%/23%
+  （避障仍好但抓取不够）。**失败模式诊断：final_distance 中位数 0.53m（v6=0.153m），94% episode
+  够不到物体** → 从零训练被避障奖励主导，策略"躲障碍但不抓取"。
+- **教训**：warm-start 必须用 `--load-model models/xxx.zip`（带前缀）或绝对路径；验证"加载预训练模型"
+  日志必须出现，否则实际从零。
+- **补充发现**：v6 的 value 网络 obstacle 输入权重 norm=12.1（价值函数感知障碍），而 actor 只有 0.178
+  （被淹没）→ 解释"v6 不避障但能评估碰撞风险"。
+
+### P5.2 v11 权重注入（v6_obsseed2 解锁感知 + 障碍随机，完成）
+- 思路：v6 保抓取但锁死避障（actor obstacle 权重≈0）；从零激活避障但丢抓取（v9/v10）。
+  **权重注入破局**：只把 v6 的 actor 输入层 obstacle 槽位 [61:64] 权重从 0.178 强注入为
+  randn×0.1（norm 3.85），保留 value 网络（12.1）与其余层 → 非障碍场景行为不变（抓取保留）、
+  障碍场景解锁感知（有梯度路径可学）。
+- 生成：`/tmp/seed_obs_weights.py` → `models/final_model_stage2_d2_v6_obsseed2.zip(+_vecnormalize.pkl)`
+- **验证**：归一化空间改 obstacle 槽位，v6_obsseed2 输出 diff 达 0.09~2.68（巨大响应）→ 感知解锁成功。
+  （原 `/tmp/probe_model_obs.py` 改"原始 obs"被 VecNormalize 压缩测不出——探针方法需在归一化空间测。）
+- 训练（500k，warm-start v6_obsseed2 + 障碍侧偏随机 ±6cm + penalty -5 + mix 0.3）：成功率 69%（训练），
+  5643 episodes。**注**：save-model 传 `models/xxx.zip` 产生双重前缀 → 实际存 `models/models/xxx.zip`，
+  已复制回 `models/`。
+- **评估（200/口径）**：
+  | 口径 | 成功率 | 碰撞率 | avg 碰撞 | avg_final_dist |
+  |---|---|---|---|---|
+  | 固定 | **71.5%** | 62% | 18.9 | 0.156 |
+  | 侧偏随机 | **68%** | 53% | 18.1 | 0.156 |
+- **结论**：① 权重注入方案成功——成功率 68-71.5%（v6 抓取保留，final_dist 0.156≈v6 0.153）；
+  ② 但碰撞率 53-62%（v6 57-65.5%）几乎没降 → **感知激活是必要不充分**；
+  ③ 根因仍是奖励经济学：碰撞惩罚 -5 太软，穿障平均 -90 < 抓取成功 +120 → 策略选穿障。
+
+### P5.3 避障实验链总结论（v5→v11 全链路）
+- **D3"0 碰撞"验收在当前配方下不可达的原因 = 两个独立配方缺陷的叠加**：
+  1. **warm-start 锁定忽略障碍**（v6 obstacle 权重≈0，后续继承 → 无梯度激活感知）——**权重注入可破解**
+     （v11：感知解锁 + 成功率 68-71.5% 保留）
+  2. **奖励经济学穿障划算**（碰撞 -5/步 vs 抓取 +120 → 穿障净赚）——**未被破解**（v11 碰撞率未降）
+- **两难**：v9 从零强避障主导 → 碰撞 7.5% 但抓取崩（0.5%）；v11 感知激活 + 弱惩罚 → 抓取保但碰撞不降。
+- **完整解**（若继续）= v11 的感知激活 + **强避障奖励**（碰撞惩罚 -20~-50 或碰撞终止，使穿障不划算）
+  + 障碍随机，且需课程/分阶段防止伤成功率（v7 大惩罚伤成功率的教训）。
+- **当前交付**：D3 维持 v6（成功率 79% 最优，0 碰撞为已知限制）；v11 为"成功率达标 + 感知已激活"
+  的中间产物（71.5%/68%）保留备查。
+
+---
+
+## 2026-08-25 · D2 静态障碍绕障完成 + D3 残差 warm-start 训练（v1→v4 调参结论）
+
+### D2 静态障碍绕障（P1，完成 ✅）
+- **config.py**：on-path 放置参数 `obstacle_on_path / obstacle_path_fraction / obstacle_path_lateral / obstacle_path_z_offset=-0.10`
+  （fraction=标称直连线段插值比例、lateral=侧偏、z_offset 罩住夹爪上部碰撞体——body 原点比碰撞 mesh 高 ~0.105m）
+  + 障碍接近惩罚/残差正则 `obstacle_w=0.5 / obstacle_range=0.15 / residual_reg_w=0.5`。
+- **reward.py**：`r_obstacle = -w·max(0,1-d/range)`（末端→障碍表面接近惩罚）+ `r_residual = -w·‖Δv‖²`（残差幅度正则）。
+- **environment.py**：必经之路放置、geom AABB 距离（比 body 原点距离准）、臂-障碍碰撞检测与计数。
+- **XML**：obstacle `contype 0→1`（MuJoCo 编译期 contype=0 的 geom 不进碰撞树，运行时改 1 无效）。
+- **静态 freejoint 障碍钉住**：每子步拉回锚点 + 清零速度（`dof_frozen` 当前 mujoco 版本不存在）；
+  否则臂会撞开障碍、RL 学"推开"而非"绕障"。
+- **验证**：新增 `scripts/check_d2.py` 5 场景断言全过（on-path 放置/geom 距离/奖励集成/碰撞检测）；`check_d1` 无回归。
+
+### D3 残差 warm-start 训练调参（P2，从 stage2_d1 warm-start）
+| 版本 | 关键差异 | 步数 | 成功率 | 平均奖励 | 结论 |
+|---|---|---|---|---|---|
+| v1 | obstacle_w=0.5, lateral=0 | 98304 | 33% | -20.3 | 基线；r_obstacle 均值 -72.7 淹没抓取信号 |
+| v2 | obstacle_w=0.2, lateral=0.03 | 98304 | 4% | -20.3 | 惩罚过弱 + lateral 间隙干扰，策略不学绕障 |
+| v3 | obstacle_w=0.35 + 碰撞惩罚/终止 | 393216 | 4% | -64 | 碰撞终止让迁移策略一探索就死（episode 均 25 步）|
+| **v4** | **obstacle_w=0.35, lateral=0, 无碰撞终止** | **500000** | **55%** | **+30.4** | **温和惩罚 + 长训方向正确** |
+| **v5** | **从 v4 warm-start 续训，参数同上** | **500000** | **60%** | **+43.5** | **续训继续提升；最近 100 episodes 成功率 69%** |
+
+- **v5（从 v4 warm-start 续训，累计 100 万步）**：成功率 **60.0%**（最近 100 episodes **69.0%**）、
+  平均奖励 **+43.5**（v4 +30.4）、平均 episode 104.6 步（v4 134.8，更快完成抓取）；最佳奖励 375.2。
+  breakdown（后 30% 收敛段，1478 episodes，成功 64.1%）：成功 `r_obstacle` **-16.32** / `r_grasp` +100 / 总 **+104.6**；
+  失败 `r_obstacle` -66.8 / `r_step` -10 / 总 -57.4。`r_residual` 成功 -0.68 / 失败 -2.81（与 v4 一致）。
+- **v4/v5 reward breakdown（收敛段）结论**：成功 episode 抓取信号 +100 完全主导、绕障代价降至 ~-16，
+  `r_obstacle` 不再淹没抓取信号（对比 v1 全期均值 -72.7）✅
+
+- **v4 breakdown（后 30% 收敛段，1148 episodes）**：成功 54.8% / `r_obstacle` **-16.75** / `r_grasp` +100 / 总 +103.8；
+  `r_residual` 成功 **-0.69** / 失败 **-2.81**（分工证据：成功=小残差干净绕障）。v5 同构、成功率更高。
+- **碰撞惩罚/终止机制**（`obstacle_collision_penalty / obstacle_collision_max_streak`）**默认关闭**：
+  v3 实证对"从无障迁移 + 障碍难绕"早期有害；真机/D6 需要"碰撞=失败"信号时再启用。
+- **产物**：`models/final_model_stage2_d2_v5.zip(+_vecnormalize.pkl)`（v4: `..._d2_v4.zip` 同上，累计 100 万步）、
+  `logs/training_log_20260825_120807.json`（v5，4924 episodes）、`logs/training_log_20260825_001907.json`（v4）。
+- **状态**：成功率回升至 50%+ 达成（v4 55% → v5 60%，最近 100 episodes 69%）；距验收线 70% 一步之遥，
+  v5 已接近（收敛段 64-69%），P2 后续再续训或轻微调参即可冲线。
+
+---
+
+## 2026-08-24 · D1 收尾（P0）：55→67 迁移工具 + optimizer state 修复 + residual 冒烟
+
+### 背景
+- D1 完成时旧课程模型（stage1/stage2，输入 55 维）在 67 维环境下 `PPO.load` 维度不匹配，无法 warm-start。
+
+### 迁移工具（`scripts/migrate_d1_checkpoint.py`）
+- 55→67 输入层手术：`policy_net[0]`/`value_net[0]` Linear 权重零扩展（前 55 列拷贝、新 12 列=0，前 55 维计算逐 bit 不变）。
+- VecNormalize obs_rms 55→67：obs_mean 补 0、obs_var 补 1、count 沿用旧值。
+- `--verify`：新旧模型 deterministic 输出最大绝对差 = 0.000e+00（无损迁移硬证据）。
+- 产物 `models/final_model_stage2_d1.zip(+_vecnormalize.pkl)`【实测 policy_net.0/value_net.0=(512,67)、obs 67】。
+
+### 关键修复：optimizer state 维度（冒烟实测发现）
+- 现象：迁移后 rollout 正常（成功率 80.8%），但首次 `optimizer.step()` 崩溃
+  `RuntimeError: tensor a (55) vs tensor b (67)`。
+- 根因：SB3 2.9.0 `PPO.save` 把 optimizer state（Adam exp_avg/exp_avg_sq，形状随输入层为 55）写入 zip；
+  运行时 `PPO.load(env=67 维)` 重建 67 维参数却加载 55 维 state → 维度不匹配。
+- 修复：migrate 改完输入层后重建 optimizer（`pol.optimizer_class(pol.parameters(), lr=1.0, **pol.optimizer_kwargs)`），
+  丢弃旧 55 维 state、新 67 维参数冷启动（新 12 槽位本无历史动量，等价）。实测 `optimizer.step()` OK。
+
+### 冒烟（residual 短训练，端到端）
+- `train_with_monitor.py --action-mode residual --total-timesteps 30000 --no-demo
+  --load-model models/final_model_stage2_d1.zip --save-model smoke_residual_d1.zip`
+- 迁移加载（VecNormalize 67 + PPO 67）✅；residual rollout 成功率 **80.5% / 78.6%**
+  （迁移无损 + residual 闭环）；2 次 PPO update 无报错 ✅；模型 + vecnormalize pkl 保存 ✅。
+- 产物 `models/smoke_residual_d1.zip(+_vecnormalize.pkl)`【实测 67 维】。
+
+---
+
+## 2026-08-24 · D1 完成：残差策略（标称轨迹 + 残差动作）+ 动态化环境地基
+
+### 交付（一周冲刺方案 §5 D1）
+- **残差策略**：`action_mode: 'delta' | 'residual'`（`config.GraspingConfig`），`nominal_trajectory.py` 提供 MoveIt 标称仿真替身（阻尼引导速度场，线速度 ≤ v_max 契约 0.12 m/s）。residual 模式 `v = v_nominal(t) + Δv/T`，RL 只学偏差；delta 模式完全旧语义（向后兼容，v_nominal 观测槽位占位 0）。
+- **动态目标地基（L2）**：`dynamic_target_enabled / target_vel_xy / target_motion_axis / target_period`——per-step 运动学写入（qpos），水平往返三角波，z 固定桌面高度；目标真值 `target_pos` / `task_state` / 观测同步更新。
+- **障碍物地基（L1 就位，L2/L3 可编程）**：`obstacle_enabled / obstacle_fixed_pos / obstacle_vel / obstacle_axis / obstacle_radius / obstacle_mass / obstacle_hidden_pos`——body 加 freejoint + step 内 qvel 赋值（可编程运动）；geom 默认 contype=0（不碰撞），激活时运行时 contype=1 + 移到 fixed_pos，隐藏时置于 hidden_pos，开关切换不返工。
+- **观测空间最终形态（67 维）**：末尾 +6 `v_nominal`（residual 真值 / delta 占位 0）+3 `obstacle_rel` +3 `obstacle_vel`，槽位预留，L2/L3 只填真值不返工。
+- **CLI（`train_with_monitor.py`）**：`--action-mode --dynamic-target --target-vel --target-axis --obstacle --obstacle-vel`；默认空/0/False 保持旧配置行为。
+
+### 关键修复（本日调试）
+- `config.py`：D1 字段此前被误插进 `RewardConfig`（而非 `GraspingConfig`），导致 `obstacle_hidden_pos` 等 AttributeError——已把 D1 块整体移到 `GraspingConfig` 末尾（RewardConfig 字段不再泄漏）。
+- `environment.py`：mujoco 3.10 移除 `jnt_qveladr`，3 处改用 `jnt_dofadr`。
+- `environment.py _get_obstacle_velocity`：不用 `data.cvel` 前 3（障碍球在桌面被接触约束转成滚动，质心瞬时线速度≈0），改读 freejoint `qvel` 前 3（世界系平移速度，即写入的 v）。
+- `environment.py _update_dynamic_target`：修正三角波公式（原公式 phase=0 时 offset=−half、周期末不连续跳变 2·half）。
+
+### 验证
+- `python3 scripts/check_obs_layout.py`：obs 67 维，`v_nominal[55:61]` / `obstacle_rel[61:64]` / `obstacle_vel[64:67]` 布局正确。
+- 新增 `scripts/check_d1.py`，4 场景断言全过：① delta 向后兼容；② residual 标称速度非零且 ≤v_max；③ 障碍激活（fixed_pos + contype=1）与可编程运动（10 步移动 21mm、vel 槽位反映速度）；④ 动态目标（单步 dx≈4mm=v·T、观测/真值一致）。
+- `train_with_monitor.py --help` 参数解析正常。
+
+---
+
+## 2026-08-24 · 简历项目方向决策：静态归 MoveIt、动态归 RL（一周冲刺方案）
+
+### 决策
+- 简历项目主线定为**混合架构动态抓取避障**（静态避障/抓取 → MoveIt2，动态避障/抓取 → RL 残差），与 `docs/混合控制架构设计.md` 三层架构一致。
+- **姿态学习明确排除**：6D 姿态维度无学习信号（`action_space_dim` 6→3 实证教训），一周内无法收敛。
+
+### 产出
+- 新增 `docs/一周冲刺方案.md`：一周渐进式动态（L1 静态闭环必达 → L2 动态目标尽力 → L3 动态演示）+ 动态化环境地基原则 + 7 天执行计划 + 保底方案（感知噪声鲁棒随机抓取）。
+- `docs/ROADMAP.md` 顶部加执行路线指针。
+- 约束：纯仿真（投实习不做真机）、偏工业岗、AI 辅助、投递前 1 周。
+
+### 下一步（执行时）
+- D1 起：`nominal_trajectory.py` + `action_mode: delta/residual` + 动态化环境地基（可编程障碍/动态目标开关/观测预留速度槽位）。
+
+---
+
+## 2026-08-24 · 随机抓取（P2.0）评估失败模式：修复"撞下桌面"，记录"悬停"为 Phase 2 已知问题
+
+### 背景
+- P2.0 随机抓取（workspace_bounds 内随机摆放）确定性评估 ≥70% 达标（ROADMAP 验收线）。
+- 评估发现失败集中在两类：① 目标附近悬停；② 把物体撞下桌面。
+
+### 结论
+- **"撞下桌面"立即修复**：物理执行层、感知无关（感知加噪声/真机只会更严重）。
+- **"悬停"不修**：奖励塑形问题（策略停在 pre-grasp 高度，下降/对齐边际收益 < 步罚）；
+  Phase 2 重训调奖励，见 ROADMAP Phase 2 已知问题。
+
+### 改动（5 处，最小必要，不碰已收敛成功路径）
+| 文件 | 改动 |
+|---|---|
+| `config.py` | 新增 `closing_align_force_tol=1.0`（接触力超 1N 停止 XY 推挤）、`closing_align_z_xy_tol=0.02`（Z 微降须 pad 在 cube 正上方） |
+| `environment.py` reset | `task_state` 加 `knocked_off_table` 标记（按 episode 清零） |
+| `environment.py` closing | ① pad 已接触 cube 即停 XY 微调（防单侧推挤撞飞）；② Z 微降加"XY 偏差<2cm"前置条件（防悬空斜压） |
+| `environment.py` `_is_done()` | 掉桌检测：cube z < table_top(0.30)-5mm → 失败终止（防撞飞后无效漫游污染数据） |
+| `environment.py` `_get_info()` | 暴露 `object_off_table` 失败原因，评估可统计撞飞率 |
+
+### 验证（冒烟测试全过）
+- reset/step 正常（obs len=55，30 随机步 obj_z 稳定 0.32）；
+- 掉桌单元测试：cube z→0.20 → `_is_done=True`、`knocked=True`、`info.object_off_table=True`；
+- reset 后标记正确清零。
+
+### 下一步
+- 评估脚本可新增撞飞率统计（`info.object_off_table`）作为迁移前健康度基线；
+- "悬停"进入 Phase 2 已知问题清单。
+
+---
+
 ## 2026-08-24 · Stage 2 完成（±6cm 迁移训练，确定性 73% 达标）
 
 ### 结论

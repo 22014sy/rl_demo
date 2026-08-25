@@ -65,6 +65,8 @@ def run_episode(agent, env, render: bool = False, max_steps: int = 500,
     episode_reward = 0
     episode_length = 0
     episode_info = []
+    episode_collision_count = 0
+    residual_norms = []
     
     while episode_length < max_steps:
         # 预测动作（2026-08-24：加 deterministic 参数，供位置迁移诊断测量随机策略成功率）
@@ -76,6 +78,9 @@ def run_episode(agent, env, render: bool = False, max_steps: int = 500,
         # 记录信息
         episode_reward += reward
         episode_length += 1
+        # D2/评估：累计臂-障碍碰撞次数 + 收集残差幅度（§3.5-5 分工证据）
+        episode_collision_count = max(episode_collision_count, info.get('obstacle_collision_count', 0))
+        residual_norms.append(info.get('residual_norm', 0.0))
         episode_info.append({
             'step': episode_length,
             'reward': reward,
@@ -99,6 +104,9 @@ def run_episode(agent, env, render: bool = False, max_steps: int = 500,
         'episode_length': episode_length,
         'grasp_success': info.get('grasp_success', False),
         'final_distance': info.get('distance_to_object', 0),
+        'collision_count': episode_collision_count,
+        'avg_residual_norm': float(np.mean(residual_norms)) if residual_norms else 0.0,
+        'max_residual_norm': float(np.max(residual_norms)) if residual_norms else 0.0,
         'episode_info': episode_info
     }
 
@@ -129,6 +137,15 @@ def evaluate_model(agent, env, n_episodes: int = 50, render: bool = False):
     avg_reward = np.mean([r['episode_reward'] for r in results])
     avg_length = np.mean([r['episode_length'] for r in results])
     avg_final_distance = np.mean([r['final_distance'] for r in results])
+
+    # D2/评估：碰撞率 + 残差幅度（§3.5-5 分工证据：成功=小残差干净绕障）
+    collision_episodes = sum(1 for r in results if r['collision_count'] > 0)
+    avg_collision_count = float(np.mean([r['collision_count'] for r in results]))
+    collision_rate = collision_episodes / n_episodes
+    _success_res = [r['avg_residual_norm'] for r in results if r['grasp_success']]
+    _fail_res = [r['avg_residual_norm'] for r in results if not r['grasp_success']]
+    avg_residual_success = float(np.mean(_success_res)) if _success_res else 0.0
+    avg_residual_fail = float(np.mean(_fail_res)) if _fail_res else 0.0
     
     # 成功episode的统计
     successful_episodes = [r for r in results if r['grasp_success']]
@@ -147,6 +164,11 @@ def evaluate_model(agent, env, n_episodes: int = 50, render: bool = False):
         'avg_final_distance': avg_final_distance,
         'avg_success_reward': avg_success_reward,
         'avg_success_length': avg_success_length,
+        'collision_rate': collision_rate,                       # 碰撞 episode 比例（D6 验收线 = 0）
+        'collision_episodes': collision_episodes,
+        'avg_collision_count': avg_collision_count,
+        'avg_residual_norm_success': avg_residual_success,      # §3.5-5：成功=小残差
+        'avg_residual_norm_fail': avg_residual_fail,            # 失败=大残差
         'episode_results': results
     }
     
@@ -156,6 +178,8 @@ def evaluate_model(agent, env, n_episodes: int = 50, render: bool = False):
     logger.info(f"平均奖励: {avg_reward:.3f}")
     logger.info(f"平均步数: {avg_length:.1f}")
     logger.info(f"平均最终距离: {avg_final_distance:.3f}")
+    logger.info(f"碰撞率: {collision_rate:.3f} ({collision_episodes}/{n_episodes} episodes, 平均碰撞 {avg_collision_count:.2f} 次/episode)")
+    logger.info(f"残差幅度‖Δv‖: 成功 {avg_residual_success:.4f} / 失败 {avg_residual_fail:.4f}")
     if successful_episodes:
         logger.info(f"成功episode平均奖励: {avg_success_reward:.3f}")
         logger.info(f"成功episode平均步数: {avg_success_length:.1f}")
@@ -242,12 +266,19 @@ def save_results(results, save_path: str):
         'avg_final_distance': results['avg_final_distance'],
         'avg_success_reward': results['avg_success_reward'],
         'avg_success_length': results['avg_success_length'],
+        'collision_rate': results['collision_rate'],
+        'collision_episodes': results['collision_episodes'],
+        'avg_collision_count': results['avg_collision_count'],
+        'avg_residual_norm_success': results['avg_residual_norm_success'],
+        'avg_residual_norm_fail': results['avg_residual_norm_fail'],
         'episode_summaries': [
             {
                 'episode_reward': r['episode_reward'],
                 'episode_length': r['episode_length'],
                 'grasp_success': r['grasp_success'],
-                'final_distance': r['final_distance']
+                'final_distance': r['final_distance'],
+                'collision_count': r['collision_count'],
+                'avg_residual_norm': r['avg_residual_norm']
             }
             for r in results['episode_results']
         ]
@@ -268,6 +299,31 @@ def main():
     parser.add_argument("--save_results", type=str, help="结果保存路径")
     parser.add_argument("--save_plot", type=str, help="图表保存路径")
     parser.add_argument("--log_level", type=str, default="INFO", help="日志级别")
+    # D1/D2/D3 训练口径（2026-08-25）：评估 D2/D3 避障模型必须与训练配置一致，
+    # 否则 config.py 默认（delta/无障碍）会测出与训练不符的错误结果
+    parser.add_argument('--action-mode', type=str, default='', choices=['', 'delta', 'residual'],
+                        help='D1 动作模式（评估 residual 模型必须传 residual）')
+    parser.add_argument('--position-random', action='store_true',
+                        help='启用物体位置随机（课程学习）；默认固定位置')
+    parser.add_argument('--radius', type=float, default=0.03, help='位置随机半径(m)')
+    parser.add_argument('--obstacle', action='store_true', help='D1 激活障碍 body')
+    parser.add_argument('--obstacle-vel', type=float, default=0.0, help='D1 障碍移动速度(m/s)')
+    parser.add_argument('--obstacle-on-path', action='store_true',
+                        help='D2 静态障碍放标称必经之路')
+    parser.add_argument('--obstacle-pos', type=str, default='',
+                        help='D2 固定障碍位置 "x,y,z"（与 --obstacle-on-path 二选一）')
+    parser.add_argument('--obstacle-w', type=float, default=-1.0,
+                        help='D2 障碍接近惩罚权重（<0 用 config 默认）')
+    parser.add_argument('--residual-reg-w', type=float, default=-1.0,
+                        help='D2 残差幅度正则权重（<0 用 config 默认）')
+    parser.add_argument('--obstacle-mix-ratio', type=float, default=-1.0,
+                        help='D3 无障碍混合采样比例（0~1；<0 用 config 默认 0）')
+    parser.add_argument('--collision-penalty', type=float, default=None,
+                        help='D3 臂-障碍碰撞当步惩罚（评估口径；≤0 有效；None=用 config 默认）')
+    parser.add_argument('--collision-max-streak', type=int, default=None,
+                        help='D3 连续碰撞步数阈值→truncated（评估口径；0=禁用；None=用 config 默认）')
+    parser.add_argument('--obstacle-path-lateral-range', type=str, default='',
+                        help='D3 v8 障碍侧偏随机化区间 "min,max"（m；每-episode 随机；空=固定）')
     
     args = parser.parse_args()
     
@@ -277,6 +333,45 @@ def main():
     try:
         # 获取配置
         config = get_config()
+
+        # D1/D2/D3 训练口径（2026-08-25）：与 train_with_monitor.py CLI 语义一致。
+        # 评估 D2/D3 避障模型必须与训练配置一致，否则 config.py 默认（delta/无障碍）
+        # 会测出与训练不符的错误结果。
+        config.grasping.render_gui = False
+        if args.action_mode:
+            config.grasping.action_mode = args.action_mode
+        if args.obstacle or args.obstacle_on_path:
+            config.grasping.obstacle_enabled = True
+        if args.obstacle_on_path:
+            config.grasping.obstacle_on_nominal_path = True
+        if args.obstacle_vel > 0:
+            config.grasping.obstacle_vel = args.obstacle_vel
+        if args.obstacle_pos:
+            config.grasping.obstacle_fixed_pos = tuple(float(v) for v in args.obstacle_pos.split(','))
+            config.grasping.obstacle_enabled = True
+        if args.obstacle_w >= 0:
+            config.reward.obstacle_w = args.obstacle_w
+        if args.residual_reg_w >= 0:
+            config.reward.residual_reg_w = args.residual_reg_w
+        if args.obstacle_mix_ratio >= 0:
+            config.grasping.obstacle_mix_ratio = args.obstacle_mix_ratio
+        if args.collision_penalty is not None:
+            config.grasping.obstacle_collision_penalty = args.collision_penalty
+        if args.collision_max_streak is not None:
+            config.grasping.obstacle_collision_max_streak = args.collision_max_streak
+        if args.obstacle_path_lateral_range:
+            _lo, _hi = (float(v) for v in args.obstacle_path_lateral_range.split(','))
+            config.grasping.obstacle_path_lateral_range = (_lo, _hi)
+        # 物体位置：默认固定（对齐 train_with_monitor 无 --position-random 的行为）；
+        # --position-random 时围绕 object_fixed_pos ±radius 随机（收窄 workspace_bounds）
+        if args.position_random:
+            cx, cy = config.grasping.object_fixed_pos
+            r = max(0.001, float(args.radius))
+            _z = config.grasping.workspace_bounds[2]
+            config.grasping.use_fixed_position = False
+            config.grasping.workspace_bounds = ((cx - r, cx + r), (cy - r, cy + r), _z)
+        else:
+            config.grasping.use_fixed_position = True
         
         # 设置默认保存路径
         results_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")

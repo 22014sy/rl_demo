@@ -270,6 +270,20 @@
     <freejoint/>
   </body>
 
+  <!-- ===== 动态障碍物（D1 地基：freejoint 可编程运动，step 内 qvel 赋值） =====
+       一周冲刺方案 §4.1：障碍物 body 加 freejoint + step 内 qvel 赋值——
+       L1 隐藏（环境把 qpos 置 obstacle_hidden_pos + 运行时改 contype=0 禁用碰撞）；
+       L2/L3 激活（环境置 obstacle_fixed_pos / 必经之路，contype=1 参与碰撞，可 qvel 驱动匀速运动）。
+       ⚠️ contype 必须在 XML 默认为 1：MuJoCo 编译期 contype=0 的 geom 不进碰撞检测树，
+       运行时再改 1 也无效（D2 实测）；XML=1 后运行时可 0/1 切换隐藏/激活。
+       开关切换只改 config，不返工。 -->
+  <body name="obstacle" pos="1.000000 1.000000 1.000000">
+    <geom type="sphere" size="0.05" rgba="0.1 0.6 0.9 1"
+      contype="1" conaffinity="1" friction="0.5 0.3 0.01" mass="0.5"
+      solimp="0.99 0.995 0.001" solref="0.01 1"/>
+    <freejoint/>
+  </body>
+
   </worldbody>
 
   <!-- ===== 臂关节速度控制 =====

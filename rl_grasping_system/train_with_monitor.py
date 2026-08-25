@@ -56,6 +56,42 @@ def main():
     parser.add_argument('--no-demo', action='store_true',
                         help='禁用演示窗口（后台/长训练推荐——GLFW 演示窗口 segfault 曾导致 PPO_97 '
                              '训练中途崩溃、模型未保存）')
+    # D1（2026-08-24，一周冲刺方案 §5）：残差策略 + 动态化环境地基
+    parser.add_argument('--action-mode', type=str, default='', choices=['', 'delta', 'residual'],
+                        help='D1 动作模式：delta=旧增量语义（默认）；residual=标称轨迹+残差叠加 v=v_nominal+Δv/T')
+    parser.add_argument('--dynamic-target', action='store_true',
+                        help='D1 动态目标（L2）：物体 per-step 沿 target_motion_axis 往返运动')
+    parser.add_argument('--target-vel', type=float, default=0.0,
+                        help='D1 动态目标水平速度(m/s)，>0 才运动（默认用 config.target_vel_xy）')
+    parser.add_argument('--target-axis', type=str, default='', choices=['', 'x', 'y'],
+                        help='D1 动态目标运动轴（默认用 config.target_motion_axis）')
+    parser.add_argument('--obstacle', action='store_true',
+                        help='D1 障碍物：激活障碍 body（参与碰撞，可编程运动）')
+    parser.add_argument('--obstacle-vel', type=float, default=0.0,
+                        help='D1 障碍移动速度(m/s)，0=静态障碍（默认用 config.obstacle_vel）')
+    # D2（2026-08-24，一周冲刺方案 §5）：静态障碍绕障 + 残差幅度正则
+    parser.add_argument('--obstacle-on-path', action='store_true',
+                        help='D2 静态障碍放"标称必经之路"（按当前目标自动放置，位置随机化时跟随）')
+    parser.add_argument('--obstacle-pos', type=str, default='',
+                        help='D2 固定障碍位置 "x,y,z"（覆盖 obstacle_fixed_pos；与 --obstacle-on-path 二选一）')
+    parser.add_argument('--obstacle-path-fraction', type=float, default=-1.0,
+                        help='D2 on-path 沿线段比例（≥0 覆盖 config.obstacle_path_fraction；<0 用默认 0.5）')
+    parser.add_argument('--obstacle-path-lateral', type=float, default=None,
+                        help='D2 on-path 侧偏 m（覆盖 config.obstacle_path_lateral；None 用默认）')
+    parser.add_argument('--obstacle-path-lateral-range', type=str, default='',
+                        help='D3 v8 障碍侧偏随机化区间 "min,max"（m；每-episode 随机，逼策略基于障碍观测动态绕障；空=固定）')
+    parser.add_argument('--obstacle-path-z-offset', type=float, default=None,
+                        help='D2 on-path z 偏移 m（覆盖 config.obstacle_path_z_offset；None 用默认 -0.10）')
+    parser.add_argument('--residual-reg', type=float, default=-1.0,
+                        help='D2 残差幅度正则权重（≥0 覆盖 config.reward.residual_reg_w；<0 用默认 0.5）')
+    parser.add_argument('--obstacle-w', type=float, default=-1.0,
+                        help='D2 障碍接近惩罚权重（≥0 覆盖 config.reward.obstacle_w；<0 用默认 0.5）')
+    parser.add_argument('--obstacle-mix-ratio', type=float, default=-1.0,
+                        help='D3 §11.4 无障碍混合采样比例（0~1；每 episode 该概率障碍隐藏做纯抓取训练；<0 用 config 默认 0）')
+    parser.add_argument('--collision-penalty', type=float, default=None,
+                        help='D3 臂-障碍碰撞当步惩罚（有效值 ≤0；0=关闭惩罚；None=用 config 默认 0）')
+    parser.add_argument('--collision-max-streak', type=int, default=None,
+                        help='D3 连续碰撞步数阈值→truncated（0=禁用；>0 启用；None=用 config 默认 0）')
     args = parser.parse_args()
 
     print("=" * 80)
@@ -84,6 +120,60 @@ def main():
         else:
             config.grasping.use_fixed_position = True
             logger.info("📍 固定位置训练")
+
+        # D1（2026-08-24，一周冲刺方案 §5）：残差策略 + 动态化环境地基
+        if args.action_mode:
+            config.grasping.action_mode = args.action_mode
+        if args.dynamic_target:
+            config.grasping.dynamic_target_enabled = True
+            if args.target_vel > 0:
+                config.grasping.target_vel_xy = args.target_vel
+            if args.target_axis:
+                config.grasping.target_motion_axis = args.target_axis
+        if args.obstacle:
+            config.grasping.obstacle_enabled = True
+            if args.obstacle_vel > 0:
+                config.grasping.obstacle_vel = args.obstacle_vel
+        # D2: 静态障碍绕障 + 残差幅度正则（一周冲刺方案 §5）
+        if args.obstacle_on_path:
+            config.grasping.obstacle_enabled = True
+            config.grasping.obstacle_on_nominal_path = True
+        if args.obstacle_pos:
+            _xyz = tuple(float(v) for v in args.obstacle_pos.split(','))
+            config.grasping.obstacle_fixed_pos = _xyz
+            config.grasping.obstacle_enabled = True
+        if args.obstacle_path_fraction >= 0:
+            config.grasping.obstacle_path_fraction = args.obstacle_path_fraction
+        if args.obstacle_path_lateral is not None:
+            config.grasping.obstacle_path_lateral = args.obstacle_path_lateral
+        if args.obstacle_path_lateral_range:
+            _lo, _hi = (float(v) for v in args.obstacle_path_lateral_range.split(','))
+            config.grasping.obstacle_path_lateral_range = (_lo, _hi)
+        if args.obstacle_path_z_offset is not None:
+            config.grasping.obstacle_path_z_offset = args.obstacle_path_z_offset
+        if args.residual_reg >= 0:
+            config.reward.residual_reg_w = args.residual_reg
+        if args.obstacle_w >= 0:
+            config.reward.obstacle_w = args.obstacle_w
+        if args.obstacle_mix_ratio >= 0:
+            config.grasping.obstacle_mix_ratio = args.obstacle_mix_ratio
+        if args.collision_penalty is not None:
+            config.grasping.obstacle_collision_penalty = args.collision_penalty
+        if args.collision_max_streak is not None:
+            config.grasping.obstacle_collision_max_streak = args.collision_max_streak
+        if args.action_mode or args.dynamic_target or args.obstacle or args.obstacle_on_path:
+            logger.info(f"🆕 D1/D2 已启用：action_mode={config.grasping.action_mode}, "
+                        f"dynamic_target={config.grasping.dynamic_target_enabled}"
+                        f"(v={config.grasping.target_vel_xy} m/s, axis={config.grasping.target_motion_axis}), "
+                        f"obstacle={config.grasping.obstacle_enabled}"
+                        f"(v={config.grasping.obstacle_vel} m/s, "
+                        f"on_path={config.grasping.obstacle_on_nominal_path}, "
+                        f"path_lateral={config.grasping.obstacle_path_lateral}, "
+                        f"path_fraction={config.grasping.obstacle_path_fraction}, "
+                        f"path_z_offset={config.grasping.obstacle_path_z_offset}), "
+                        f"reward: obstacle_w={config.reward.obstacle_w}, "
+                        f"residual_reg_w={config.reward.residual_reg_w}")
+
         n_envs = max(1, int(config.system.num_envs))
         if args.total_timesteps > 0:
             config.training.total_timesteps = int(args.total_timesteps)

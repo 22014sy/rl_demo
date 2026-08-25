@@ -84,6 +84,13 @@ class GraspingConfig:
     approach_speed_limit: float = 0.12    # pad 距 cube < approach_speed_dist 时末端线速度限幅 (m/s)（对应实机 UR 慢速 Servo 接近）
     approach_speed_dist: float = 0.06     # 接近限速触发距离（pad 中心→cube；仅抓取最后一段限速，避免 home 全程触发）
     grasp_force_limit: float = 20.0       # closing/closed 阶段 pad-cube 接触力上限 (N)；超限不再加压（对应 2F-85 set_gripper_force 力控）
+
+    # 2026-08-24 随机抓取评估防侧推：closing 阶段 pad 已接触 cube（接触力 > 该值(N)）即停止 XY 微调，
+    #   避免单侧压着 cube 侧向推挤把物体撞下桌面；未接触（悬空对正）时不受影响。
+    closing_align_force_tol: float = 1.0
+    # 2026-08-24 方案① Z 微降的安全条件：pad 中心与 cube 中心 XY 偏差 < 该值(m) 才允许悬空 Z 微降，
+    #   悬空斜压 cube 边缘是"撞下桌面"另一根源；pad 偏斜时先由 XY 微调对正再下降。
+    closing_align_z_xy_tol: float = 0.02
     gripper_close_speed: float = 50.0     # Task3 阻抗更轻柔：closing 每决策步 ctrl 增量（速度斜坡，pad 慢速接触；
                                           # 对应实机 2F-85 set_gripper_speed）
     grasp_min_width: float = 0.02        # 成功阈值：闭合后手指开度(m) 仍 > 该值 = 被物体挡住合不上
@@ -116,10 +123,76 @@ class GraspingConfig:
 
     # 任务配置
     target_object: str = "target_cube"  # 目标物体名称
-    use_fixed_position: bool = True  # True=固定桌面位置(object_fixed_pos)；False=在workspace_bounds的X/Y内随机（P0-2）
+    use_fixed_position: bool = False  # True=固定桌面位置(object_fixed_pos)；False=在workspace_bounds的X/Y内随机（P0-2）
     object_fixed_pos: Tuple[float, float] = (0.1, 0.42)  # Task3: cube 桌面水平位置（换位后；原 -0.134,0.492 对齐 home pinch）
     object_rest_z: float = 0.32  # Task3: 物体落定高度 = 桌面顶(0.30) + 半边长(0.02)；Panda 桌面在 z=0 时原为 0.02
     table_top_z: float = 0.30    # Task3: 桌面顶面高度（初始位形防碰撞校验用）
+    # ============================================================
+    # D1（2026-08-24，一周冲刺方案 §5）残差策略 + 动态化环境地基
+    # 目标：L1 静态闭环（MoveIt 标称 + RL 残差绕障抓取）的地基第一天就位，
+    #       动态目标（L2）/ 动态障碍（L3）只改开关、不返工。
+    # ============================================================
+
+    # --- D1 残差策略：action_mode ---
+    # 'delta'    = 现有行为：RL 输出末端增量，v_raw = Δ/T（无标称轨迹，旧模型语义）
+    # 'residual' = 混合残差：v = v_nominal(t) + Δv/T（MoveIt 标称主导 + RL 只学偏差，
+    #              对应 docs/混合控制架构设计.md §5.2 Servo 叠加执行语义）
+    action_mode: str = "delta"
+
+    # --- D1 标称轨迹（MoveIt 标称仿真替身，见 nominal_trajectory.py）---
+    # residual 模式自动启用；delta 模式下标称参考速度槽位为 0（观测预留，见观测空间最终形态）
+    nominal_approach_speed: float = 0.12    # 标称接近速度上限 (m/s)，≤ v_max 契约 0.125（docs/sim_to_real动力学匹配方案.md）
+    nominal_hover_z_offset: float = 0.134   # 标称悬停高度 = 物体上方 pre_grasp_offset_z（pad 对准 cube 中心）
+    nominal_gain: float = 3.0               # 标称速度场增益（阻尼引导：远端匀速 v_max，近端线性减速收敛）
+
+    # --- D1 动态目标（L2 激活；L1 静止占位）---
+    # 物体位置可 per-step 更新（运动学 qpos 写入，z 固定桌面高度 object_rest_z）
+    dynamic_target_enabled: bool = False    # 是否启用动态目标
+    target_vel_xy: float = 0.0              # 目标水平移动速度 (m/s)；0=静止（L1）
+    target_motion_axis: str = "x"           # 运动轴：'x' 或 'y'
+    target_period: float = 6.0              # 往返运动周期 (s)（target_vel_xy>0 时生效，三角波往返）
+
+    # --- D1 障碍物地基（D1 起就位；L1 隐藏/固定，L2/L3 激活可编程运动）---
+    # 障碍物 body 加 freejoint + step 内 qvel 赋值（可编程运动）；geom 默认 contype=0
+    # （不参与碰撞），环境激活时运行时改 contype=1 并移动到 obstacle_fixed_pos——
+    # 开关切换不返工（一周冲刺方案 §4.1）。
+    obstacle_enabled: bool = False          # 是否启用障碍物
+    obstacle_fixed_pos: Tuple[float, float, float] = (0.06, 0.40, 0.35)  # 固定障碍位置（桌面上的球，球底=桌面顶0.30）
+    obstacle_vel: float = 0.0               # 障碍移动速度 (m/s)；0=静态障碍（L1）
+    obstacle_axis: str = "y"                # 移动方向轴：'x' 或 'y'
+    obstacle_radius: float = 0.05           # 障碍半径 (m)（与 XML geom size 一致）
+    obstacle_mass: float = 0.5              # 障碍质量 (kg)（与 XML geom mass 一致）
+    obstacle_hidden_pos: Tuple[float, float, float] = (1.0, 1.0, 1.0)  # 未启用时放置处（远离场景，不参与碰撞）
+
+    # --- D2 静态障碍绕障（一周冲刺方案 §5；架构文档 §5.3）---
+    # "放标称必经之路"：障碍按当前目标位置自动放在 home→pre-grasp 线段上（reset 时计算），
+    # 物体位置随机化（use_fixed_position=False）时障碍随目标跟随，保证每个 episode 都逼 RL 绕障。
+    # 与 obstacle_fixed_pos 互斥：obstacle_on_nominal_path=True 时忽略 fixed_pos（优先级更高）。
+    obstacle_on_nominal_path: bool = False   # 是否放"标称必经之路"（home→pre-grasp 线段上自动放置）
+    # D3 §11.4 无障碍混合采样（2026-08-25）：每 episode 以该概率隐藏障碍做"纯抓取训练"，
+    # 防止残差策略在绕障训练中把已学抓取技能覆盖（v5 失败 episode r_obstacle=-66.8 的实证——
+    # 只有 70% 绕障样本时旧技能被冲刷）。0=全激活（保持旧行为/check 脚本）；D3 训练传 0.3。
+    obstacle_mix_ratio: float = 0.0
+    obstacle_path_fraction: float = 0.5      # 沿线段的放置比例（0=home 端，1=pre-grasp 端，0.5=中点）
+    obstacle_path_lateral: float = 0.0       # 侧偏(m，相对路径 XY 法向；>0 向 +y 侧，<0 向 -y 侧，0=正落路径）
+    # D3 v8（2026-08-25）：每-episode 障碍侧偏随机化区间（m）。默认 (0.0, 0.0)=固定。
+    # 障碍位置固定时策略学会"平均路径"直接穿障（残差恒定、无动态绕障，v5/v6/v7 碰撞率卡 65% 根因）；
+    # 设置非零区间（如 (-0.06, 0.06)）→ reset 随机 lateral，强制策略基于障碍观测（obstacle_dist 槽位）
+    # 学"看障碍在左绕左、在右绕右"的泛化避障。评估时同步随机以测泛化。
+    obstacle_path_lateral_range: Tuple[float, float] = (0.0, 0.0)
+    # z 偏移默认 -0.10：障碍相对"标称路径高度"下移，罩住夹爪上部碰撞体（rq_base_mount mesh
+    # 在 body 原点下方 ~0.105m）——否则球放在 body 路径高度会从夹爪上方掠过、挡不住。绝对值随
+    # 末端结构可调（正=抬高，负=降低）；自动约束 z ≥ 桌面顶 + 半径 + 0.02。
+    obstacle_path_z_offset: float = -0.10
+    # D3 调参（架构文档 §5.3）：碰撞 = 失败信号。实测（v3）对"从无障迁移 + 障碍难绕"的早期，
+    # 碰撞终止会让策略一探索就死（episode 平均 25 步），学不到绕障——故**默认关闭**：
+    #   obstacle_collision_penalty=0  （碰撞当步无额外惩罚；接近惩罚已由 r_obstacle 提供梯度）
+    #   obstacle_collision_max_streak=0（0=禁用提前终止；>0 时连续碰撞超阈值 truncated）
+    # 真机/评估（D6）需要"碰撞=失败"时再启用。
+    obstacle_collision_penalty: float = 0.0   # 撞上当步额外惩罚（<0 生效，叠加在接近惩罚之上）
+    obstacle_collision_max_streak: int = 0    # 连续碰撞步数阈值 -> truncated（0=禁用；如 20 ≈0.8s 持续撞障）
+
+
 
 @dataclass
 class NetworkConfig:
@@ -236,6 +309,17 @@ class RewardConfig:
     anchor_w_z: float = 2.0          # z 锚定势能权重（方案A 2026-08-22: 1.0→2.0，配合 anchor_dist_z 0.04→0.06，近距离下压梯度更强）
     anchor_dist_z: float = 0.06      # z 锚定激活距离(m)（方案A 2026-08-22: 0.04→0.06，覆盖 pad 悬停区 Z差4-6cm，
                                       # 让"降到接触"的最后一段持续有塑形梯度）
+
+    # --- D2 障碍接近惩罚 + 残差幅度正则（一周冲刺方案 §5；架构文档 §5.3）---
+    # 障碍接近惩罚（连续负奖励 shaping，d=末端 base_mount → 障碍表面的距离）：
+    #   r_obstacle = -obstacle_w * max(0, 1 - d / obstacle_range)
+    #   仅障碍启用时非零；obstacle_enabled=False 时 env 传 obstacle_dist=inf → 恒 0，不干扰旧训练。
+    # 残差幅度正则（仅 residual 模式；delta 模式 env 传 residual_norm=0 → 恒 0）：
+    #   r_residual = -residual_reg_w * ||Δv||²     （L2 鼓励小残差：静态场景 Δv≈0，动态才出手——
+    #   对应"残差幅度统计：静态小/动态大"架构分工，见 nominal_trajectory.py / 混合控制架构设计.md）
+    obstacle_w: float = 0.5        # 障碍接近惩罚权重（d=0 时惩罚 -0.5/步）
+    obstacle_range: float = 0.15   # 接近惩罚触发距离(m)（末端→障碍表面 > 该距离 → r_obstacle=0）
+    residual_reg_w: float = 0.5    # 残差幅度正则权重（||Δv||=0.125 上限时约 -0.0078/步，温和不淹没抓取信号）
 
 @dataclass
 class SystemConfig:

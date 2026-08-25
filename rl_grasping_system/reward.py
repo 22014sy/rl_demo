@@ -67,7 +67,8 @@ def orientation_align(q_hand, q_target):
 # 放在返回值 b['diag'] 里，**绝不进入奖励**（P1.3 修复：此前 sum(values()) 把
 # orient_align、z_axis_z 也算进奖励，而 z_axis_z=“手指朝上+1/朝下−1”，等于把 P1.2
 # 修复掉的反向信号以系数 1 重新注入奖励——这正是方向项修了却不见效的原因之一）。
-REWARD_KEYS = ('r_dist_xy', 'r_dist_z', 'r_orient', 'r_contact', 'r_close', 'r_grasp', 'r_success', 'r_step')
+REWARD_KEYS = ('r_dist_xy', 'r_dist_z', 'r_orient', 'r_contact', 'r_close', 'r_grasp', 'r_success',
+               'r_obstacle', 'r_residual', 'r_step')
 
 
 def _anchor_boost(w, d, d_target):
@@ -147,6 +148,15 @@ def reward_breakdown(state, prev_state, grasp_info, reward_config=None):
         reward_config = RewardConfig()
     gamma = getattr(reward_config, 'shaping_gamma', 0.99)
 
+    # D2: 障碍接近惩罚 + 残差幅度正则（一周冲刺方案 §5 / 架构文档 §5.3）。
+    # 障碍未启用或远离（obstacle_dist=inf）→ r_obstacle=0；残差正则仅 residual 模式喂入
+    # residual_norm（delta 模式 env 传 0）→ r_residual=0，完全不干扰旧训练。
+    obstacle_dist = float(grasp_info.get('obstacle_dist', float('inf')))
+    residual_norm = float(grasp_info.get('residual_norm', 0.0))
+    _d_range = max(1e-6, float(getattr(reward_config, 'obstacle_range', 0.15)))
+    _r_obstacle = -float(getattr(reward_config, 'obstacle_w', 0.0)) * max(0.0, 1.0 - obstacle_dist / _d_range)
+    _r_residual = -float(getattr(reward_config, 'residual_reg_w', 0.0)) * residual_norm * residual_norm
+
     ee = np.asarray(state['ee_position'], dtype=float)
     obj = np.asarray(state['target_position'], dtype=float)
     target = obj + np.array([0.0, 0.0, reward_config.pre_grasp_offset_z])
@@ -197,6 +207,8 @@ def reward_breakdown(state, prev_state, grasp_info, reward_config=None):
         parts['r_grasp'] = 0.0
         parts['r_success'] = 0.0
         parts['r_step'] = 0.0  # 2026-08-23: 抬升不计入训练步数，也不扣步惩罚（一致性）
+        parts['r_obstacle'] = 0.0  # D2: 抬升阶段 RL 已成功，冻结障碍/残差惩罚（一致性）
+        parts['r_residual'] = 0.0
         if prev_state is not None:
             parts['r_dist_xy'] = 0.0
             parts['r_dist_z'] = 0.0
@@ -209,12 +221,17 @@ def reward_breakdown(state, prev_state, grasp_info, reward_config=None):
         parts['r_grasp'] = reward_config.grasp_reward if rising else 0.0
         parts['r_success'] = reward_config.completion_reward if rising else 0.0
     parts['r_step'] = -reward_config.step_penalty
+    # D2: 障碍接近惩罚 + 残差幅度正则（在 r_step 后统一写入；事件分支不覆盖——接近惩罚全程生效）
+    parts['r_obstacle'] = _r_obstacle
+    parts['r_residual'] = _r_residual
 
     # 纯诊断键（不进入 calculate_reward 的和）
     parts['diag'] = {
         'orient_align': align,
         'z_axis_z': z_axis_z,
         'potential': potential,
+        'obstacle_dist': obstacle_dist,   # D2 诊断
+        'residual_norm': residual_norm,   # D2 诊断
     }
     return parts
 
