@@ -324,6 +324,16 @@ def main():
                         help='D3 连续碰撞步数阈值→truncated（评估口径；0=禁用；None=用 config 默认）')
     parser.add_argument('--obstacle-path-lateral-range', type=str, default='',
                         help='D3 v8 障碍侧偏随机化区间 "min,max"（m；每-episode 随机；空=固定）')
+    parser.add_argument('--obstacle-count', type=int, default=None,
+                        help='v12 激活的静态障碍数量 1~3（覆盖 config.obstacle_count；None 用默认 1）。'
+                             '>1 时沿必经之路不同 fraction/lateral 排布，观测仍只给最近激活障碍槽位（67 维不变）')
+    parser.add_argument('--scenario-mix', type=str, default='',
+                        help='P3 评估口径（2026-08-27）：per-episode 场景采样 "静态无障,动态目标无障,动态目标+动态障碍"'
+                             ' 概率（如 0.4,0.3,0.3；空=旧机制全跟随全局开关）。需配合 --target-vel --obstacle')
+    parser.add_argument('--target-vel', type=float, default=-1.0,
+                        help='P3 动态目标速度 (m/s)（>=0 覆盖 config.target_vel_xy；<0 用默认 0）')
+    parser.add_argument('--target-axis', type=str, default='',
+                        help='P3 动态目标运动轴（空=用 config.target_motion_axis）')
     
     args = parser.parse_args()
     
@@ -362,6 +372,19 @@ def main():
         if args.obstacle_path_lateral_range:
             _lo, _hi = (float(v) for v in args.obstacle_path_lateral_range.split(','))
             config.grasping.obstacle_path_lateral_range = (_lo, _hi)
+        if args.obstacle_count is not None:
+            config.grasping.obstacle_count = args.obstacle_count
+        if args.scenario_mix:
+            _v = tuple(float(x) for x in args.scenario_mix.split(','))
+            if len(_v) != 3:
+                raise SystemExit('--scenario-mix 需要 3 个概率 "静态,动态,动态+障碍"（如 0.4,0.3,0.3）')
+            config.grasping.scenario_mix = _v
+            config.grasping.dynamic_target_enabled = True
+            config.grasping.obstacle_enabled = True
+        if args.target_vel >= 0:
+            config.grasping.target_vel_xy = args.target_vel
+        if args.target_axis:
+            config.grasping.target_motion_axis = args.target_axis
         # 物体位置：默认固定（对齐 train_with_monitor 无 --position-random 的行为）；
         # --position-random 时围绕 object_fixed_pos ±radius 随机（收窄 workspace_bounds）
         if args.position_random:

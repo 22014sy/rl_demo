@@ -284,6 +284,24 @@
     <freejoint/>
   </body>
 
+  <!-- ===== 附加静态障碍（v12 多障碍：obstacle_2 / obstacle_3） =====
+       与 obstacle 同构（sphere r=0.05 + freejoint + contype=1）；
+       环境按 obstacle_count 激活前 N 个，激活时置必经之路不同 fraction/lateral，
+       未激活（隐藏/超出 count）置远处 obstacle_hidden_pos + contype=0 不参与碰撞。
+       观测只保留"最近激活障碍"的 rel/vel 槽位（67 维不变，兼容旧模型 warm-start）。 -->
+  <body name="obstacle_2" pos="1.000000 1.000000 1.000000">
+    <geom type="sphere" size="0.05" rgba="0.9 0.6 0.1 1"
+      contype="1" conaffinity="1" friction="0.5 0.3 0.01" mass="0.5"
+      solimp="0.99 0.995 0.001" solref="0.01 1"/>
+    <freejoint/>
+  </body>
+  <body name="obstacle_3" pos="1.000000 1.000000 1.000000">
+    <geom type="sphere" size="0.05" rgba="0.6 0.1 0.9 1"
+      contype="1" conaffinity="1" friction="0.5 0.3 0.01" mass="0.5"
+      solimp="0.99 0.995 0.001" solref="0.01 1"/>
+    <freejoint/>
+  </body>
+
   </worldbody>
 
   <!-- ===== 臂关节速度控制 =====

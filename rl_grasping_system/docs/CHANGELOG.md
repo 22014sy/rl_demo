@@ -5,6 +5,76 @@
 
 ---
 
+## 2026-08-27 · P3 训练分布启动 + 实习项目立项（Week1）
+
+### 背景（文档）
+- 创建 `docs/2026-08-27_RL训练失败分析_v5到v12b.md`：v5→v12b 八版失败的四类机制归因
+  （A 无信号 / B 奖励经济学 / C 感知锁死 / D 探索压死）→ 混合架构决策树 + 业界理论对应。
+- 创建 `docs/2026-08-27_实习项目4周计划.md`：投具身智能 RL 实习的 4 周冲刺计划
+  （W1 动态抓取闭环 → W2 peg-in-hole+基线 → W3 残差 RL+鲁棒性 → W4 消融+交付）+ 毕设 sim2real 接口预留。
+
+### P3 训练分布：per-episode 场景采样（40/30/30）
+- **config.py**：`scenario_mix: Tuple[float,float,float] = None`（(静态无障, 动态目标无障, 动态目标+动态障碍)；
+  None=旧机制全跟随全局开关，兼容 check）。P3 传 (0.4,0.3,0.3)。
+- **environment.py**：reset 按 scenario_mix 采样 `_dyn_active/_obstacle_active`（选中场景强制覆盖全局开关）；
+  `_update_dynamic_target` 改查 `_dyn_active`；`__init__` 初始化 `_dyn_active`。
+- **train_with_monitor.py / evaluate.py**：`--scenario-mix "0.4,0.3,0.3"` CLI（需配合
+  `--dynamic-target --target-vel` + `--obstacle --obstacle-vel`）。
+- **验证**：200 reset 分布 38.5%/30.0%/31.5%（≈40/30/30）✓；scenario_mix=None 旧机制回归 ✓；
+  check_d1 全 PASS ✓。
+
+### P3 训练三连（v13→v15）结果
+| 版本 | 配方 | 静态 | 动态0.03 | 动态0.05 | 动态+障碍 | 说明 |
+|---|---|---|---|---|---|---|
+| v13_p3 | warm-start v11 + mix(0.4,0.3,0.3) + residual_reg 0.5 | 80% | 73.3% | 35% | 70%/碰撞78% | 残差恒定 0.216≈饱和干扰标称；动态障碍 fixed 远离路径 |
+| v14_p3b | + on-path 动态障碍 + residual_reg 1.5 | **95%** | 83.3% | 66.7% | 70%/碰撞93% | 双修复生效；双动态避障仍失败 |
+| v15_p3c | + 双动态 50% + obstacle_w 2 + collision -5 | **96.7%** | 91.7% | 83.3% | **90%/碰撞80%** | **Week1 3/4 达标** |
+
+**Week1 交付**：静态 96.7% / 动态 0.03 91.7% / 动态 0.05 83.3%（3/4 验收线达标）；
+双动态碰撞 80% 为奖励经济学 trade-off 残余（成功率 90% 已达标）。
+
+### Bugfix
+- **train_with_monitor.py**：`--obstacle-on-path` 分支补 `--obstacle-vel` 应用（原只 `--obstacle`
+  分支生效 → on-path 障碍被钉住成静态，v13 碰撞率 78% 根因之一）。
+
+### 动态障碍运动修复（2026-08-27，用户观察驱动）
+- **问题**：动态障碍（obstacle_vel>0）原实现只设 axis qvel → freejoint 障碍受重力 z 颠簸
+  （视觉竖直掉落）+ 0.05m/s 直线飞走（看起来像 v5 静态障碍）。
+- **修复**：`environment.py _update_obstacle_motion` v>0 分支改为**运动学横向往返三角波**
+  （锚点 ±obstacle_half_range 沿 obstacle_axis 往返，z 每子步钉住，qvel 设往返方向）；
+  `config.py` 新增 `obstacle_period=4.0` / `obstacle_half_range=0.12`；reset 清 `_obs_motion_t`。
+- **最小验证**：z 波动 0.0000m（钉住）、y 波动 0.12m（横向横移）、qvel 方向切换 10 次/250步（往返）
+  、障碍扫过路径时被机械臂物理挡住（真实接触挡路）；check_d2 全 PASS。
+
+### 动态障碍运动修复 2（2026-08-27，用户要求"在桌面上随机移动"）
+- **`config.py`**：`obstacle_motion_mode: str = 'random'`（'random'=桌面 XY 随机游走 / 'roundtrip'=固定轴往返）、
+  `obstacle_dir_change=2.0`（方向随机重采样间隔 s）、`obstacle_wander_bounds`（X∈[-0.18,0.15], Y∈[0.28,0.48]）。
+- **`environment.py`**：`_update_obstacle_motion` v>0 分支按 mode 分发——
+  random：方向每 dir_change 秒随机重采样 + 边界镜面反弹 + z 钉住锚点高度（运动学写入 + qvel 设方向）；
+  roundtrip：保留对称往返。reset 初始化 `_obs_dir/_obs_dir_t`。
+- **最小验证**：z 波动 0.0001m、X 游走 0.28m / Y 游走 0.20m（均在边界内）、方向变化 18 次/500 步；
+  check_d2 全 PASS。
+- **demo**：`results/demo/final_model_stage2_d2_v15_p3c_dual{1,2,3}.gif`（动态目标+随机游走障碍，双视角）。
+
+### 三视图 demo + 多障碍独立随机游走（2026-08-27，用户要求）
+- **`environment.py`**：随机游走方向改 **per-bid dict**（`_obs_dir/_obs_dir_t` 按障碍 body 存）——
+  `obstacle_count>1` 时各障碍独立随机方向/游走（reset 初始化为空 dict，首次 `_update_obstacle_motion` 惰性采样）。
+- **`scripts/show_grasp_demo.py`**：
+  - 新增 `_set_side_camera`：**侧面近距离特写**（从夹爪 +x 侧、略高于桌面看，主体=夹爪+下方桌面，障碍靠近时看清间隙/碰撞）；
+  - 新增 `--triple` 三视图：左 track 特写 + 中俯拍 + 右侧面碰撞观察（H×(3W)）；
+  - 新增 `--obstacle-count`（多障碍 demo）。
+- **验证**：2 障碍独立方向（差 2.35 rad）、各自游走（X 0.33/Y 0.20 与 X 0.24/Y 0.13）。
+- **demo**：`results/demo/final_model_stage2_d2_v15_p3c_triple{1,2}.gif`（35/60 帧，1920×480 三视图）、
+  `v15_triple_strip.png`（4 时刻条带）、`v15_side_view_frame.png`（右侧面单帧）。
+
+### P3 训练启动（v13_p3）
+- 命令：`--load-model models/final_model_stage2_d2_v11_500k.zip --action-mode residual
+  --dynamic-target --target-vel 0.05 --obstacle --obstacle-vel 0.05 --scenario-mix 0.4,0.3,0.3
+  --total-timesteps 500000 --save-model final_model_stage2_d2_v13_p3.zip --no-demo`
+- 冒烟 8k 步：warm-start v11 加载 ✓，成功率起步 ~54%（与 P2b 兼容性评估 53% 一致）。
+- 完整训练后台运行（PID 30494，预计 2-4h）。
+
+
 ## 2026-08-25 · D3 无障碍混合采样 + v6 warm-start 训练（v5→v6 冲线）
 
 ### P0 量化 v5 现状（evaluate.py 补训练口径 CLI + 碰撞率/残差统计）
@@ -157,6 +227,53 @@
   + 障碍随机，且需课程/分阶段防止伤成功率（v7 大惩罚伤成功率的教训）。
 - **当前交付**：D3 维持 v6（成功率 79% 最优，0 碰撞为已知限制）；v11 为"成功率达标 + 感知已激活"
   的中间产物（71.5%/68%）保留备查。
+
+### P5.4 v12 多障碍 + 碰撞即失败 + 强接近惩罚（2026-08-27，执行中）
+- **用户指令**：① 增加静态障碍数量 ② 碰到障碍算失败 ③ 接近障碍惩罚权重上调 ④ 混入无障碍训练样本。
+- **实现**：
+  - **XML**：新增 `obstacle_2 / obstacle_3` body（与 obstacle 同构 sphere r=0.05 + freejoint + contype=1）。
+  - **config.py**：`obstacle_count: int = 1`（激活障碍数量，≤3）。
+  - **environment.py** 多障碍全链路：收集 body 列表（`obstacle_body_ids`）、按 count 激活前 N 个
+    （超出隐藏 contype=0）、碰撞=任一激活障碍、接近距离=所有激活障碍 min、运动钉住逐障碍处理。
+  - **关键设计：观测保持 67 维不变**——obstacle_rel/vel 只给**最近激活障碍**（v12 前逻辑槽位）。
+    → warm-start v11 无需输入层手术，PPO/VecNormalize 直接复用。
+  - **布局：横向"障碍墙"**。路径水平投影仅 ~8cm（home 末端已贴近 pre-grasp），多球沿线竖排必重叠/
+    贴臂；改沿路径法向铺开（frac=[0.45,0.60,0.75], latbases=[-0.12,0,0.12]）+ 墙整体随机 lateral
+    ±[0.03,0.05]（每-episode 随机逼基于观测绕墙，外推兜底 ±0.21）+ **物理接触级防初始贴臂**
+    （mj_forward 后 `_check_arm_obstacle_contact` 拦截，对 max_streak=1"碰撞即失败"必须初始不碰）。
+  - **奖励**：`obstacle_w 0.35→1.0`（接近惩罚×3）、`collision_penalty -5→-20`（碰撞当步大惩罚）、
+    `collision_max_streak 0→1`（**碰一步即失败 terminated**——破解"穿障平均 -90 < +120"奖励经济学）、
+    `mix 0.3` 保留（30% 无障碍纯抓取保底，防碰撞终止洗掉抓取技能）。
+- **CLI**：train/evaluate 均加 `--obstacle-count`。
+- **验证**：`/tmp/check_v12_multiblock.py` 全部 PASS（3 body 收集 / count 激活 / 横向墙布局 /
+  最近障碍观测 / min 距离 / 任一碰撞+惩罚+终止 / mix 隐藏 / 单障碍回归）；`check_d1`/`check_d2` 无回归。
+  压力测试：count=3 零动作首步真实碰撞率 ~8%（保守度量，训练中 warm-start 策略首步即移动，实际更低）。
+- **训练**：`--load-model models/final_model_stage2_d2_v11_500k.zip --obstacle-count 3 --obstacle-w 1.0
+  --residual-reg 0.3 --obstacle-mix-ratio 0.3 --collision-penalty -20 --collision-max-streak 1
+  --total-timesteps 500000 --save-model final_model_stage2_d2_v12_500k.zip --no-demo`。
+  冒烟（8k 步）确认 warm-start 加载 + 碰撞终止生效（首 rollout 成功率 22%、平均步数 27——穿障路径
+  变"碰→死"的预期回落，靠 30% 无障碍样本 + 绕障学习恢复）。
+- **v12 结果（500k，3 障碍口径评估 200 eps）**：
+  | 指标 | v12 | v11 | 说明 |
+  |---|---|---|---|
+  | 成功率 | **25.0%** | 68~71.5% | 崩（v11 一半以下） |
+  | 碰撞率 | **71%** | 53~62% | 反而更高 |
+  | avg 碰撞 | **0.71** | 18.1~18.9 | 大降（碰一次即终止，非"不碰"） |
+  | avg_final_dist | 0.222 | 0.156 | 够不到物体 |
+  | avg_episode_len | 25.1 | ~90 | 碰撞终止压缩 |
+- **结论（决定性负结果）**：**max_streak=1"碰到算失败"复现 v3 失败模式**——碰撞终止把探索空间压死
+  （episode 平均 25 步），策略"一碰就死"、无"碰→退→绕"试错路径，即使感知激活 + 当步 -20 + 接近惩罚
+  也学不到绕障（成功率 25% 且碰撞率 71% 反而升高）。奖励经济学仍未破解，但这次失败是**学习动力学**
+  问题（无探索空间）而非信号强度问题。→ v12b 将 max_streak 放宽至 **3**（连续碰 3 步才失败，
+  保留"持续碰撞=失败"语义，给碰一步后逃生/重试的探索空间）。
+- **v12b（max_streak=3，同参数 warm-start v11，500k，13:05 启动 13:16 提前终止）**：
+  - 前 5 个 rollout 成功率 25.9/26.8/24.2/23.5/25.5（平台 24-27%，与 v12 完全一致）；
+    训练统计成功率 **15%**（stdout，最近 100 eps）比 v12 更差（碰撞惩罚更重）。
+  - **提前终止理由**：v12（同族 max_streak=1）已用 20 个 rollout 证明"碰撞终止"配方族不爬升，
+    v12b 前 5 个 rollout 完全复现且更差，继续是浪费。
+  - **结论**：max_streak 1/3 均无效——**warm-start 策略在"碰撞终止"配方下学不到绕障**，
+    与 v8（无终止）/v11（弱惩罚）一起构成完整负证据链：warm-start 路线（v5→v12b 七版）全部失败；
+    **唯一学会避障的是从零训练（v9，碰撞 7.5%，但抓取 0.5%）**。
 
 ---
 

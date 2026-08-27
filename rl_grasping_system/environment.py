@@ -48,6 +48,9 @@ class GraspingEnv(gym.Env):
         # D1: 动态化环境地基开关
         self.dynamic_target_enabled = bool(getattr(grasping_config, 'dynamic_target_enabled', False))
         self.obstacle_enabled = bool(getattr(grasping_config, 'obstacle_enabled', False))
+        # P3（2026-08-27）per-episode 场景状态：本 episode 动态目标是否激活（_dyn_active）。
+        # reset() 按 scenario_mix 采样（None 时跟随全局开关）；obstacle 侧见 _obstacle_active。
+        self._dyn_active = self.dynamic_target_enabled
         # D3 §11.4 无障碍混合采样：本 episode 障碍是否激活。reset() 按 obstacle_mix_ratio 采样；
         # _obstacle_active 驱动激活/观测槽位/接近惩罚/碰撞计数全链路（隐藏 episode=纯抓取训练）。
         self._obstacle_active = self.obstacle_enabled
@@ -257,16 +260,27 @@ class GraspingEnv(gym.Env):
             # 查找物体ID（用于设置物体位置）
             self.object_id = self.target_body_id  # 使用相同的ID
 
-            # D1: 查找障碍物 body 与其 geom（动态化地基；找不到则禁用）
-            self.obstacle_body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "obstacle")
-            self.obstacle_geom_ids = []
-            if self.obstacle_body_id != -1:
-                for g in range(self.model.ngeom):
-                    if self.model.geom_bodyid[g] == self.obstacle_body_id:
-                        self.obstacle_geom_ids.append(g)
+            # D1: 查找障碍物 body 与其 geom（动态化地基；找不到则禁用）。
+            # v12 多障碍：收集 XML 中 obstacle / obstacle_2 / obstacle_3（可按 obstacle_count 激活前 N 个）。
+            # obstacle_body_id / obstacle_geom_ids / _obstacle_freejoint_idx 保留为第一个（兼容旧调用/check 脚本）。
+            self.obstacle_body_ids = []
+            for _ob_name in ('obstacle', 'obstacle_2', 'obstacle_3'):
+                _bid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, _ob_name)
+                if _bid != -1:
+                    self.obstacle_body_ids.append(_bid)
+            self.obstacle_body_id = self.obstacle_body_ids[0] if self.obstacle_body_ids else -1
+            self.obstacle_geom_ids = []          # 第一个障碍的 geom（兼容旧调用）
+            self.obstacle_geom_ids_all = []      # 所有障碍 geom（v12 碰撞/距离用）
+            for _bid in self.obstacle_body_ids:
+                _geoms = [g for g in range(self.model.ngeom) if self.model.geom_bodyid[g] == _bid]
+                self.obstacle_geom_ids_all.extend(_geoms)
+                if _bid == self.obstacle_body_id:
+                    self.obstacle_geom_ids = list(_geoms)
             # D1: 障碍物/目标物体的 freejoint 索引（可编程运动 / per-step 更新用）
-            self._obstacle_freejoint_idx = self._find_freejoint_idx(self.obstacle_body_id) \
-                if self.obstacle_body_id != -1 else None
+            self._obstacle_freejoint_idxs = [self._find_freejoint_idx(_bid)
+                                             for _bid in self.obstacle_body_ids]
+            self._obstacle_freejoint_idx = self._obstacle_freejoint_idxs[0] \
+                if self._obstacle_freejoint_idxs else None
             self._target_freejoint_idx = self._find_freejoint_idx(self.object_id) \
                 if self.object_id is not None else None
 
@@ -351,6 +365,8 @@ class GraspingEnv(gym.Env):
         # D1: 动态目标（L2）——基准位置 = 本次采样位置，时间从 0 起（L1 静止不触发）
         self._dyn_target_t = 0.0
         self._dyn_target_base_xy = object_pos[:2].copy()
+        # 2026-08-27: 目标速度（标称前馈用；L1 静止恒 0，L2 由 _update_dynamic_target 维护）
+        self._dyn_target_vel = np.zeros(3)
         
         # 重置episode监控
         self.episode_start_time = time.time()
@@ -411,10 +427,36 @@ class GraspingEnv(gym.Env):
             except Exception:
                 pass
         
-        # D3 §11.4 无障碍混合采样：每 episode 以 obstacle_mix_ratio 概率隐藏障碍做"纯抓取训练"
-        # （防残差策略覆盖 v5 已学抓取技能——对比 v5 失败 r_obstacle=-66.8 的实证）；否则正常激活。
-        _mix = float(getattr(self.grasping_config, 'obstacle_mix_ratio', 0.0))
-        self._obstacle_active = self.obstacle_enabled and float(self.np_random.uniform()) >= _mix
+        # P3（2026-08-27）per-episode 场景采样：40% 静态无障 + 30% 动态目标 + 30% 动态目标+动态障碍。
+        # 选中场景强制覆盖全局开关（配合 CLI --dynamic-target/--obstacle 提供 target_vel_xy/obstacle_vel）。
+        # None（默认）= 旧机制：动态目标全跟随全局开关；障碍按 obstacle_mix_ratio 隐藏（check 兼容）。
+        _sm = getattr(self.grasping_config, 'scenario_mix', None)
+        if _sm is not None:
+            _s, _d, _do = (max(0.0, float(x)) for x in _sm[:3])
+            _tot = _s + _d + _do
+            if _tot <= 0.0:
+                _tot = 1.0
+            _r = float(self.np_random.uniform()) * _tot
+            if _r < _s:
+                self._dyn_active = False
+                self._obstacle_active = False
+            elif _r < _s + _d:
+                self._dyn_active = True
+                self._obstacle_active = False
+            else:
+                self._dyn_active = True
+                self._obstacle_active = True
+        else:
+            # D3 §11.4 无障碍混合采样：每 episode 以 obstacle_mix_ratio 概率隐藏障碍做"纯抓取训练"
+            # （防残差策略覆盖 v5 已学抓取技能——对比 v5 失败 r_obstacle=-66.8 的实证）；否则正常激活。
+            _mix = float(getattr(self.grasping_config, 'obstacle_mix_ratio', 0.0))
+            self._obstacle_active = self.obstacle_enabled and float(self.np_random.uniform()) >= _mix
+        self._dyn_active = bool(getattr(self, '_dyn_active', self.dynamic_target_enabled))
+        # P3（2026-08-27）：障碍横向往返相位每 episode 清零（从锚点起跑，复刻 _dyn_target_t）；
+        # random 模式方向 per-bid dict（多障碍各自随机方向，首次访问时采样）
+        self._obs_motion_t = 0.0
+        self._obs_dir = {}
+        self._obs_dir_t = {}
         # D1: 障碍物激活/隐藏（contype 运行时切换 + freejoint 位置写入；开关切换不返工）
         self._set_obstacle_active(self._obstacle_active)
 
@@ -432,7 +474,7 @@ class GraspingEnv(gym.Env):
             if _lrange[0] != _lrange[1]:
                 self.grasping_config.obstacle_path_lateral = float(
                     self.np_random.uniform(_lrange[0], _lrange[1]))
-            self._place_obstacle_on_path()
+            self._place_obstacles_on_path()
             mujoco.mj_forward(self.model, self.data)
 
         # Task3 防初始碰撞：随机初始位形可能使 pad 低于桌面顶（手指插进桌面），
@@ -498,7 +540,8 @@ class GraspingEnv(gym.Env):
             # delta 模式保持旧语义 v = Δ/T，标称速度槽位置 0（观测预留）。
             if self.action_mode == 'residual' and self.nominal_trajectory is not None:
                 self._v_nominal = self.nominal_trajectory.reference_velocity(
-                    current_state['ee_position'], self.target_pos, T)
+                    current_state['ee_position'], self.target_pos, T,
+                    target_vel=getattr(self, '_dyn_target_vel', None))
                 v_raw = self._v_nominal + _res_delta
             else:
                 self._v_nominal = np.zeros(6)
@@ -810,35 +853,52 @@ class GraspingEnv(gym.Env):
     def _set_obstacle_active(self, active: bool):
         """D1: 障碍物激活/隐藏——contype 运行时切换 + freejoint 位置写入。
 
-        L1 隐藏（默认）：障碍置于 obstacle_hidden_pos 远处，geom contype=0 不参与碰撞，
-        对已收敛训练/评估零干扰；L2/L3 激活：置 obstacle_fixed_pos 并 contype=1 参与
-        碰撞（D2 避障/绕障用）。开关切换只改 config，不返工。
+        L1 隐藏（默认）：所有障碍置于 obstacle_hidden_pos 远处，geom contype=0 不参与碰撞，
+        对已收敛训练/评估零干扰；L2/L3 激活：按 obstacle_count 激活前 N 个障碍
+        （obstacle/obstacle_2/...，v12 多障碍），置 obstacle_fixed_pos 并 contype=1 参与
+        碰撞（D2 避障/绕障用）；超出 count 的障碍保持隐藏。开关切换只改 config，不返工。
         """
-        if getattr(self, 'obstacle_body_id', -1) < 0:
+        if not self.obstacle_body_ids:
             return
         act = bool(active)
-        # 运行时改碰撞属性（model 端，reset 后 mj_forward 即生效）
-        for g in self.obstacle_geom_ids:
-            self.model.geom_contype[g] = 1 if act else 0
-            self.model.geom_conaffinity[g] = 1 if act else 0
-        # freejoint qpos 写入（位置(3)+四元数(4)），并清空速度
-        if self._obstacle_freejoint_idx is not None:
-            qadr = self.model.jnt_qposadr[self._obstacle_freejoint_idx]
-            pos = (self.grasping_config.obstacle_fixed_pos if act
-                   else self.grasping_config.obstacle_hidden_pos)
-            self.data.qpos[qadr:qadr + 3] = np.asarray(pos, dtype=float)
-            self.data.qpos[qadr + 3:qadr + 7] = np.array([1, 0, 0, 0])
-            qvadr = self.model.jnt_dofadr[self._obstacle_freejoint_idx]
-            self.data.qvel[qvadr:qvadr + 6] = 0.0
-            # D2: 静态障碍锚点（_update_obstacle_motion 每子步钉住用）
-            self._obstacle_anchor_pos = np.asarray(pos, dtype=float).copy()
-        self.logger.debug(f"D1 障碍物{'激活' if act else '隐藏'}，contype={'1' if act else '0'}")
+        n_active = max(1, int(getattr(self.grasping_config, 'obstacle_count', 1)))
+        self._active_obstacle_body_ids = []
+        anchors = {}
+        for i, _bid in enumerate(self.obstacle_body_ids):
+            _is_act = act and (i < n_active)
+            for g in self.obstacle_geom_ids_all:
+                if self.model.geom_bodyid[g] == _bid:
+                    self.model.geom_contype[g] = 1 if _is_act else 0
+                    self.model.geom_conaffinity[g] = 1 if _is_act else 0
+            _fidx = self._obstacle_freejoint_idxs[i]
+            if _fidx is not None:
+                # freejoint qpos 写入（位置(3)+四元数(4)），并清空速度
+                qadr = self.model.jnt_qposadr[_fidx]
+                pos = (self.grasping_config.obstacle_fixed_pos if _is_act
+                       else self.grasping_config.obstacle_hidden_pos)
+                self.data.qpos[qadr:qadr + 3] = np.asarray(pos, dtype=float)
+                self.data.qpos[qadr + 3:qadr + 7] = np.array([1, 0, 0, 0])
+                qvadr = self.model.jnt_dofadr[_fidx]
+                self.data.qvel[qvadr:qvadr + 6] = 0.0
+                anchors[_bid] = np.asarray(pos, dtype=float).copy()
+            if _is_act:
+                self._active_obstacle_body_ids.append(_bid)
+        # D2: 静态障碍锚点（_update_obstacle_motion 每子步钉住用）；保留第一个激活锚点兼容旧调用
+        self._obstacle_anchors = anchors
+        self._obstacle_anchor_pos = (anchors[self.obstacle_body_id].copy()
+                                     if self.obstacle_body_id in anchors else None)
+        self.logger.debug(f"D1 障碍物{'激活' if act else '隐藏'}，active_count={len(self._active_obstacle_body_ids)}")
 
     def _get_obstacle_position(self) -> np.ndarray:
-        """障碍物世界系位置（xpos，经 mj_forward/mj_step 更新）"""
+        """障碍物世界系位置（xpos，经 mj_forward/mj_step 更新）——第一个障碍（兼容旧调用）"""
         if getattr(self, 'obstacle_body_id', -1) < 0:
             return np.zeros(3)
         return self.data.xpos[self.obstacle_body_id].copy()
+
+    def _get_obstacle_positions(self) -> list:
+        """v12: 所有激活障碍的世界系位置列表（xpos；未激活/隐藏时为空列表）。"""
+        return [self.data.xpos[_bid].copy()
+                for _bid in getattr(self, '_active_obstacle_body_ids', [])]
 
     def _get_obstacle_velocity(self) -> np.ndarray:
         """障碍物世界系线速度（freejoint qvel 前 3 维，即质心世界系平动速度）。
@@ -854,6 +914,16 @@ class GraspingEnv(gym.Env):
         qvadr = self.model.jnt_dofadr[self._obstacle_freejoint_idx]
         return self.data.qvel[qvadr:qvadr + 3].copy()
 
+    def _get_obstacle_velocity_by_id(self, body_id) -> np.ndarray:
+        """v12: 指定障碍的世界系线速度（freejoint qvel 前 3 维，同 _get_obstacle_velocity 语义）。"""
+        if body_id not in self.obstacle_body_ids:
+            return np.zeros(3)
+        _fidx = self._obstacle_freejoint_idxs[self.obstacle_body_ids.index(body_id)]
+        if _fidx is None:
+            return np.zeros(3)
+        qvadr = self.model.jnt_dofadr[_fidx]
+        return self.data.qvel[qvadr:qvadr + 3].copy()
+
     def _update_dynamic_target(self, dt: float):
         """D1 动态目标（L2）：per-step 运动学更新（z 固定桌面高度，水平往返三角波）。
 
@@ -862,7 +932,7 @@ class GraspingEnv(gym.Env):
         目标真值 self.target_pos / task_state['object_position'] 同步更新，
         观测 target_position 与奖励（_dist_cost 读 state['target_position']）自动跟随。
         """
-        if not self.dynamic_target_enabled:
+        if not getattr(self, '_dyn_active', self.dynamic_target_enabled):
             return
         self._dyn_target_t += float(dt)
         v = float(getattr(self.grasping_config, 'target_vel_xy', 0.0))
@@ -875,6 +945,9 @@ class GraspingEnv(gym.Env):
         half = max(1e-6, v * period / 2.0)
         phase = (self._dyn_target_t % period) / period
         offset = 2.0 * half * (phase if phase < 0.5 else 1.0 - phase)
+        # 2026-08-27: 目标速度（三角波斜率为 ±v，标称前馈抵消 P 控制跟踪滞后）
+        self._dyn_target_vel = np.zeros(3)
+        self._dyn_target_vel[axis] = v if phase < 0.5 else -v
         pos = self._get_object_position().copy()  # 保持当前 z（桌面高度）
         pos[axis] = self._dyn_target_base_xy[axis] + offset
         # 运动学写入（qpos），并清空 freejoint 速度防漂移
@@ -891,66 +964,223 @@ class GraspingEnv(gym.Env):
         一周冲刺方案 §4.1：障碍物 body 加 freejoint + step 内 qvel 赋值。
         激活 + obstacle_vel>0 时每物理子步把 freejoint 线速度轴写为 v，mj_step 积分推进；
         静态障碍（obstacle_vel=0）仅位置固定不驱动；隐藏时已置远处且 contype=0 不受影响。
+        v12 多障碍：对所有激活障碍逐一处理（各自锚点/自由关节）。
         """
-        if not getattr(self, '_obstacle_active', False) or getattr(self, 'obstacle_body_id', -1) < 0:
-            return
-        if self._obstacle_freejoint_idx is None:
+        if not getattr(self, '_obstacle_active', False) or not self.obstacle_body_ids:
             return
         v = float(getattr(self.grasping_config, 'obstacle_vel', 0.0))
-        qadr = self.model.jnt_qposadr[self._obstacle_freejoint_idx]
-        qvadr = self.model.jnt_dofadr[self._obstacle_freejoint_idx]
-        if v == 0.0:
-            # D2: 静态障碍 = 运动学钉住——每物理子步把 freejoint 拉回锚点并清零速度，
-            # 等效刚性固定（接触推不动），逼 RL 学"绕障"而非"推开障碍"。
-            anchor = getattr(self, '_obstacle_anchor_pos', None)
+        active = set(getattr(self, '_active_obstacle_body_ids', []))
+        for i, _bid in enumerate(self.obstacle_body_ids):
+            if _bid not in active:
+                continue
+            _fidx = self._obstacle_freejoint_idxs[i]
+            if _fidx is None:
+                continue
+            qadr = self.model.jnt_qposadr[_fidx]
+            qvadr = self.model.jnt_dofadr[_fidx]
+            if v == 0.0:
+                # D2: 静态障碍 = 运动学钉住——每物理子步把 freejoint 拉回锚点并清零速度，
+                # 等效刚性固定（接触推不动），逼 RL 学"绕障"而非"推开障碍"。
+                anchor = (self._obstacle_anchors or {}).get(_bid)
+                if anchor is None:
+                    anchor = np.asarray(self.grasping_config.obstacle_fixed_pos, dtype=float)
+                self.data.qpos[qadr:qadr + 3] = anchor
+                self.data.qpos[qadr + 3:qadr + 7] = np.array([1.0, 0.0, 0.0, 0.0])
+                self.data.qvel[qvadr:qvadr + 6] = 0.0
+                continue
+            axis = 0 if str(getattr(self.grasping_config, 'obstacle_axis', 'y')) == 'x' else 1
+            # P3 修复（2026-08-27，用户观察"动态障碍竖直掉落/像静态"）：动态障碍 = 桌面横向随机游走
+            # 或固定轴往返（obstacle_motion_mode），z 每子步钉住。原实现只设 axis qvel：freejoint 障碍
+            # 受重力 z 颠簸（视觉掉落）+ 直线飞走 + 0.05m/s 看似静止。
+            anchor = (self._obstacle_anchors or {}).get(_bid)
             if anchor is None:
                 anchor = np.asarray(self.grasping_config.obstacle_fixed_pos, dtype=float)
-            self.data.qpos[qadr:qadr + 3] = anchor
+            anchor_z = float(anchor[2])
+            mode = str(getattr(self.grasping_config, 'obstacle_motion_mode', 'random'))
+            if mode == 'roundtrip':
+                # 对称三角波往返：offset ∈ [-half, +half]（锚点两侧沿 axis 往返扫过路径）
+                self._obs_motion_t = getattr(self, '_obs_motion_t', 0.0) + float(dt)
+                period = max(0.1, float(getattr(self.grasping_config, 'obstacle_period', 4.0)))
+                half = max(1e-4, float(getattr(self.grasping_config, 'obstacle_half_range', 0.12)))
+                phase = (self._obs_motion_t % period) / period
+                offset = 2.0 * half * (phase if phase < 0.5 else 1.0 - phase) - half
+                pos = np.array(anchor, dtype=float).copy()
+                pos[axis] = anchor[axis] + offset
+                self.data.qvel[qvadr:qvadr + 6] = 0.0
+                self.data.qvel[qvadr + axis] = v if phase < 0.5 else -v
+            else:
+                # random：桌面 XY 随机游走——方向每 obstacle_dir_change 秒随机重采样，
+                # 边界反弹（镜面反射），z 钉住锚点高度。从当前 qpos 推进（on-path 锚点起步）。
+                # 多障碍（obstacle_count>1）各自独立方向（per-bid dict）。
+                if not hasattr(self, '_obs_dir') or self._obs_dir is None:
+                    self._obs_dir = {}
+                if _bid not in self._obs_dir:
+                    self._obs_dir[_bid] = float(self.np_random.uniform(0.0, 2.0 * np.pi))
+                if not hasattr(self, '_obs_dir_t') or not isinstance(self._obs_dir_t, dict):
+                    self._obs_dir_t = {}
+                self._obs_dir_t[_bid] = self._obs_dir_t.get(_bid, 0.0) + float(dt)
+                dchange = max(0.1, float(getattr(self.grasping_config, 'obstacle_dir_change', 2.0)))
+                if self._obs_dir_t[_bid] >= dchange:
+                    self._obs_dir[_bid] = float(self.np_random.uniform(0.0, 2.0 * np.pi))
+                    self._obs_dir_t[_bid] = 0.0
+                theta = self._obs_dir[_bid]
+                pos = np.array(self.data.qpos[qadr:qadr + 3], dtype=float)
+                pos[0] += v * float(dt) * np.cos(theta)
+                pos[1] += v * float(dt) * np.sin(theta)
+                (xmin, xmax), (ymin, ymax) = tuple(
+                    tuple(float(c) for c in rng)
+                    for rng in getattr(self.grasping_config, 'obstacle_wander_bounds',
+                                       ((-0.18, 0.15), (0.28, 0.48))))
+                if pos[0] < xmin:
+                    pos[0], self._obs_dir[_bid] = xmin, np.pi - theta
+                elif pos[0] > xmax:
+                    pos[0], self._obs_dir[_bid] = xmax, np.pi - theta
+                if pos[1] < ymin:
+                    pos[1], self._obs_dir[_bid] = ymin, -theta
+                elif pos[1] > ymax:
+                    pos[1], self._obs_dir[_bid] = ymax, -theta
+                pos[2] = anchor_z
+                self.data.qvel[qvadr:qvadr + 6] = 0.0
+                self.data.qvel[qvadr] = v * np.cos(self._obs_dir[_bid])
+                self.data.qvel[qvadr + 1] = v * np.sin(self._obs_dir[_bid])
+            self.data.qpos[qadr:qadr + 3] = pos
             self.data.qpos[qadr + 3:qadr + 7] = np.array([1.0, 0.0, 0.0, 0.0])
-            self.data.qvel[qvadr:qvadr + 6] = 0.0
-            return
-        axis = 0 if str(getattr(self.grasping_config, 'obstacle_axis', 'y')) == 'x' else 1
-        self.data.qvel[qvadr:qvadr + 6] = 0.0
-        self.data.qvel[qvadr + axis] = v
 
     # ===================== D2 静态障碍绕障（一周冲刺方案 §5；架构文档 §5.3） =====================
-    def _place_obstacle_on_path(self):
-        """D2: 静态障碍放"标称必经之路"——home→pre-grasp 线段上自动放置（qpos 写入 + 清空速度）。
+    def _distance_arm_surface(self, pos, r: float) -> float:
+        """D2/v12: 障碍球心 pos 到机械臂最近碰撞体表面（AABB 减障碍半径）的距离(m)，负=接触。"""
+        best = float('inf')
+        for g in self._arm_obstacle_geoms():
+            if self.model.geom_contype[g] == 0:
+                continue
+            d = np.abs(self.data.geom_xpos[g] - np.asarray(pos, dtype=float)) - self.model.geom_size[g]
+            d = float(np.linalg.norm(np.maximum(d, 0.0)))
+            if d < best:
+                best = d
+        return max(0.0, best - r) if best != float('inf') else float('inf')
+
+    def _write_obstacle_pos(self, _bid: int, pos):
+        """D2/v12: 写入指定障碍 freejoint qpos（位置+四元数）+ 清空速度 + 记录锚点（静态钉住用）。"""
+        if _bid not in self.obstacle_body_ids:
+            return
+        _fidx = self._obstacle_freejoint_idxs[self.obstacle_body_ids.index(_bid)]
+        if _fidx is None:
+            return
+        qadr = self.model.jnt_qposadr[_fidx]
+        self.data.qpos[qadr:qadr + 3] = np.asarray(pos, dtype=float)
+        self.data.qpos[qadr + 3:qadr + 7] = np.array([1.0, 0.0, 0.0, 0.0])
+        qvadr = self.model.jnt_dofadr[_fidx]
+        self.data.qvel[qvadr:qvadr + 6] = 0.0
+        if not hasattr(self, '_obstacle_anchors') or self._obstacle_anchors is None:
+            self._obstacle_anchors = {}
+        self._obstacle_anchors[_bid] = np.asarray(pos, dtype=float).copy()
+        if _bid == self.obstacle_body_id:
+            self._obstacle_anchor_pos = np.asarray(pos, dtype=float).copy()
+        self.logger.debug(f"D2 障碍{_bid}放必经之路: {np.round(pos, 3)}")
+
+    def _place_obstacles_on_path(self):
+        """D2/v12: 静态障碍放"标称必经之路"——home→pre-grasp 线段上自动放置（qpos 写入 + 清空速度）。
 
         线段端点：start = 当前末端（home，reset 后），end = 物体上方 pre-grasp 点
-        （object + [0,0,pre_grasp_offset_z]）；障碍 = 线段 obstacle_path_fraction 处
-        + XY 法向侧偏（obstacle_path_lateral）+ z 偏移，并约束 z ≥ 桌面顶 + 半径 + 0.02
-        （障碍悬浮桌面之上、不与桌面接触）。物体位置随机化时障碍随目标跟随。
-        需在 mj_forward 之后调用（末端 xpos 才正确）。
+        （object + [0,0,pre_grasp_offset_z]）；障碍 = 线段 fraction 处 + XY 法向侧偏（lateral）
+        + z 偏移，并约束 z ≥ 桌面顶 + 半径 + 0.02（障碍悬浮桌面之上、不与桌面接触）。
+        物体位置随机化时障碍随目标跟随。需在 mj_forward 之后调用（末端 xpos 才正确）。
+
+        v12 多障碍（obstacle_count>1）：路径水平投影短（~0.08m），沿线竖排会重叠/贴臂，
+        故改**横向"障碍墙"**——障碍沿路径法向铺开（latbases 依次 −x/0/+x），fraction 集中
+        路径中后段（避开 home 端初始位形），墙整体随机 lateral（wall ∈ ±[0.03,0.05]，
+        避免 wall=0 贴臂；每-episode 随机 → 逼策略基于障碍观测绕墙）。放置后检查
+        XY 最小间距（≥2r 防重叠）与到臂表面距离（≥0.06 防初始碰撞——对
+        obstacle_collision_max_streak=1 "碰撞即失败"训练，初始贴臂=episode 第一步即失败），
+        不满足则重采样 wall。
+        单障碍（count=1）行为与旧版一致（fraction=obstacle_path_fraction, lateral 参数）。
         """
-        if (getattr(self, 'obstacle_body_id', -1) < 0
-                or getattr(self, '_obstacle_freejoint_idx', None) is None):
+        if not self.obstacle_body_ids:
             return
         start = self._get_end_effector_position().copy()
         obj = self._get_object_position().copy()
         pre_z = float(getattr(self.reward_config, 'pre_grasp_offset_z', 0.134))
         end = obj + np.array([0.0, 0.0, pre_z])
-        frac = float(np.clip(getattr(self.grasping_config, 'obstacle_path_fraction', 0.5), 0.0, 1.0))
-        lateral = float(getattr(self.grasping_config, 'obstacle_path_lateral', 0.0))
         z_off = float(getattr(self.grasping_config, 'obstacle_path_z_offset', 0.0))
-        mid = start + (end - start) * frac
-        lat = np.zeros(3)
-        dxy = end[:2] - start[:2]
-        n = float(np.linalg.norm(dxy))
-        if n > 1e-6:
-            lat = np.array([-dxy[1] / n, dxy[0] / n, 0.0]) * lateral
-        pos = mid + lat + np.array([0.0, 0.0, z_off])
         r = float(getattr(self.grasping_config, 'obstacle_radius', 0.05))
         table_top = float(getattr(self.grasping_config, 'table_top_z', 0.30))
-        pos[2] = max(pos[2], table_top + r + 0.02)  # 悬浮桌面之上
-        qadr = self.model.jnt_qposadr[self._obstacle_freejoint_idx]
-        self.data.qpos[qadr:qadr + 3] = pos
-        self.data.qpos[qadr + 3:qadr + 7] = np.array([1.0, 0.0, 0.0, 0.0])
-        qvadr = self.model.jnt_dofadr[self._obstacle_freejoint_idx]
-        self.data.qvel[qvadr:qvadr + 6] = 0.0
-        # D2: 静态障碍锚点（_update_obstacle_motion 每子步钉住用）
-        self._obstacle_anchor_pos = pos.copy()
-        self.logger.debug(f"D2 障碍放必经之路: {np.round(pos, 3)}")
+        dxy = end[:2] - start[:2]
+        n = float(np.linalg.norm(dxy))
+        lat_dir = np.zeros(3)
+        if n > 1e-6:
+            lat_dir = np.array([-dxy[1] / n, dxy[0] / n, 0.0])
+        active = list(getattr(self, '_active_obstacle_body_ids', self.obstacle_body_ids[:1]))
+        n_act = len(active)
+        lrange = tuple(getattr(self.grasping_config, 'obstacle_path_lateral_range', (0.0, 0.0)))
+        base_lateral = float(getattr(self.grasping_config, 'obstacle_path_lateral', 0.0))
+        min_gap = 2.0 * r  # 球不重叠的物理下限（多障碍横向排布用）
+
+        if n_act > 1:
+            # v12 多障碍：横向障碍墙（路径水平段短，竖排会重叠/贴臂）
+            if n_act == 3:
+                fracs = [0.45, 0.60, 0.75]
+                latbases = [-0.12, 0.0, 0.12]
+            elif n_act == 2:
+                fracs = [0.45, 0.75]
+                latbases = [-0.07, 0.07]
+            else:
+                fracs = [0.5 + (i - (n_act - 1) / 2.0) * 0.15 for i in range(n_act)]
+                latbases = [-0.08 + 0.16 * i / max(1, n_act - 1) for i in range(n_act)]
+            cand = []
+            wall = 0.0
+            # 候选 wall：3 次随机 ±[0.03,0.05] + 4 对外推 ±{0.06..0.15}（墙整体外推远离臂，
+            # 应对物体位置随机下路径方向变化；min_arm 最大者兜底）。
+            # 拦截条件为**物理接触级**（mj_forward 后 _check_arm_obstacle_contact）——
+            # AABB 距离阈值过于保守（单障碍 v11 初始距离也常 <0.06 但仅 26% 真接触，
+            # 多障碍横向排布真接触≈4%），只拦真接触避免过度外推导致障碍偏离路径。
+            wall_cands = [float(self.np_random.uniform(0.03, 0.05))
+                          * (1.0 if self.np_random.uniform() < 0.5 else -1.0) for _ in range(3)]
+            for _ex in (0.06, 0.09, 0.12, 0.15, 0.18, 0.21):
+                wall_cands += [_ex, -_ex]
+            best_cand, best_arm = [], -1.0
+            for wall in wall_cands:
+                cand = []
+                for i, _bid in enumerate(active):
+                    frac = float(np.clip(fracs[i], 0.15, 0.85))
+                    lateral = latbases[i] + wall
+                    pos = start + (end - start) * frac + lat_dir * lateral + np.array([0.0, 0.0, z_off])
+                    pos[2] = max(pos[2], table_top + r + 0.02)
+                    cand.append((_bid, pos))
+                ok_layout = True
+                min_arm = float('inf')
+                for i in range(len(cand)):
+                    for j in range(i + 1, len(cand)):
+                        if np.linalg.norm(cand[i][1][:2] - cand[j][1][:2]) < min_gap:
+                            ok_layout = False
+                            break
+                    if not ok_layout:
+                        break
+                if ok_layout:
+                    for _bid, pos in cand:
+                        min_arm = min(min_arm, self._distance_arm_surface(pos, r))
+                    # 物理接触级初始安全：写候选布局并 mj_forward 检查是否与臂接触
+                    for _bid, pos in cand:
+                        self._write_obstacle_pos(_bid, pos)
+                    mujoco.mj_forward(self.model, self.data)
+                    if self._check_arm_obstacle_contact():
+                        ok_layout = False
+                if min_arm > best_arm:
+                    best_arm, best_cand = min_arm, list(cand)
+                if ok_layout:
+                    break
+            if not ok_layout and best_cand:
+                cand = best_cand  # 全失败兜底：取初始最安全（min_arm 最大）的布局
+            for _bid, pos in cand:
+                self._write_obstacle_pos(_bid, pos)
+            mujoco.mj_forward(self.model, self.data)
+        else:
+            # 单障碍（保持旧行为）
+            frac = float(np.clip(getattr(self.grasping_config, 'obstacle_path_fraction', 0.5), 0.0, 1.0))
+            lateral = (float(self.np_random.uniform(lrange[0], lrange[1]))
+                       if lrange[0] != lrange[1] else base_lateral)
+            pos = start + (end - start) * frac + lat_dir * lateral + np.array([0.0, 0.0, z_off])
+            pos[2] = max(pos[2], table_top + r + 0.02)
+            self._write_obstacle_pos(active[0], pos)
 
     def _get_obstacle_distance(self) -> float:
         """D2: 夹爪/机械臂最近碰撞体（contype>0 的 geom）到障碍表面的距离(m)。
@@ -959,29 +1189,30 @@ class GraspingEnv(gym.Env):
         在 body 原点下方 ~0.105m，用原点会高估距离、接近惩罚失效）；
         障碍未启用/隐藏时返回 inf（→ r_obstacle=0）。
         """
-        if not getattr(self, '_obstacle_active', False) or getattr(self, 'obstacle_body_id', -1) < 0:
+        if not getattr(self, '_obstacle_active', False) or not self.obstacle_body_ids:
             return float('inf')
-        obs = self._get_obstacle_position()
         r = float(getattr(self.grasping_config, 'obstacle_radius', 0.05))
         best = float('inf')
-        for g in self._arm_obstacle_geoms():
-            if self.model.geom_contype[g] == 0:
-                continue  # 只算参与碰撞的几何体
-            d = np.abs(self.data.geom_xpos[g] - obs) - self.model.geom_size[g]
-            d = float(np.linalg.norm(np.maximum(d, 0.0)))
-            if d < best:
-                best = d
+        for _bid in getattr(self, '_active_obstacle_body_ids', []):
+            obs = self.data.xpos[_bid].copy()
+            for g in self._arm_obstacle_geoms():
+                if self.model.geom_contype[g] == 0:
+                    continue  # 只算参与碰撞的几何体
+                d = np.abs(self.data.geom_xpos[g] - obs) - self.model.geom_size[g]
+                d = float(np.linalg.norm(np.maximum(d, 0.0)))
+                if d < best:
+                    best = d
         if best == float('inf'):
             return float('inf')
         return max(0.0, best - r)
 
     def _arm_obstacle_geoms(self) -> set:
-        """机械臂 + 夹爪的全部 geom id（排除桌面/目标 cube/障碍本身）——D2 臂-障碍碰撞检测用。惰性缓存。"""
+        """机械臂 + 夹爪的全部 geom id（排除桌面/目标 cube/全部障碍 body）——D2 臂-障碍碰撞检测用。惰性缓存。"""
         if getattr(self, '_arm_geom_ids', None) is None:
             ids = set()
             for i in range(self.model.ngeom):
                 body_id = self.model.geom_bodyid[i]
-                if body_id == self.obstacle_body_id:
+                if body_id in self.obstacle_body_ids:
                     continue
                 if self.object_id is not None and body_id == self.object_id:
                     continue
@@ -993,10 +1224,13 @@ class GraspingEnv(gym.Env):
         return self._arm_geom_ids
 
     def _check_arm_obstacle_contact(self) -> bool:
-        """D2: 机械臂（含夹爪）与障碍物的真实物理接触（data.contact，仿 _check_grasp_contact）。"""
-        if not getattr(self, '_obstacle_active', False) or not self.obstacle_geom_ids:
+        """D2/v12: 机械臂（含夹爪）与任一激活障碍的真实物理接触（data.contact，仿 _check_grasp_contact）。
+
+        隐藏障碍 geom contype=0 不进入接触检测树，故 obstacle_geom_ids_all（含隐藏障碍）
+        直接作障碍集合是安全的。"""
+        if not getattr(self, '_obstacle_active', False) or not self.obstacle_geom_ids_all:
             return False
-        obs = set(self.obstacle_geom_ids)
+        obs = set(self.obstacle_geom_ids_all)
         arm = self._arm_obstacle_geoms()
         for c in self.data.contact:
             if (c.geom1 in obs and c.geom2 in arm) or (c.geom2 in obs and c.geom1 in arm):
@@ -1180,9 +1414,18 @@ class GraspingEnv(gym.Env):
         # ② 障碍相对末端位姿（obstacle_rel = ee − obstacle；启用时真值，否则占位 0）
         # ③ 障碍速度（世界系线速度；启用时真值，否则占位 0）
         v_nominal = np.asarray(self._v_nominal, dtype=float) if getattr(self, '_v_nominal', None) is not None else np.zeros(6)
-        if getattr(self, '_obstacle_active', False) and getattr(self, 'obstacle_body_id', -1) >= 0:
-            obstacle_rel = np.asarray(state['ee_position'], dtype=float) - self._get_obstacle_position()
-            obstacle_vel = self._get_obstacle_velocity()
+        if getattr(self, '_obstacle_active', False) and self.obstacle_body_ids:
+            obs_poses = self._get_obstacle_positions()
+            if obs_poses:
+                ee = np.asarray(state['ee_position'], dtype=float)
+                dists = [float(np.linalg.norm(ee - p)) for p in obs_poses]
+                _idx = int(np.argmin(dists))
+                obstacle_rel = ee - obs_poses[_idx]  # v12 多障碍：只给最近激活障碍的 rel/vel（67 维不变）
+                _bid = getattr(self, '_active_obstacle_body_ids', [])[_idx]
+                obstacle_vel = self._get_obstacle_velocity_by_id(_bid)
+            else:
+                obstacle_rel = np.zeros(3)
+                obstacle_vel = np.zeros(3)
         else:
             obstacle_rel = np.zeros(3)
             obstacle_vel = np.zeros(3)

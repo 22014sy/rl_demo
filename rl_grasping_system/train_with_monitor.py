@@ -82,12 +82,19 @@ def main():
                         help='D3 v8 障碍侧偏随机化区间 "min,max"（m；每-episode 随机，逼策略基于障碍观测动态绕障；空=固定）')
     parser.add_argument('--obstacle-path-z-offset', type=float, default=None,
                         help='D2 on-path z 偏移 m（覆盖 config.obstacle_path_z_offset；None 用默认 -0.10）')
+    parser.add_argument('--obstacle-count', type=int, default=None,
+                        help='v12 激活的静态障碍数量 1~3（覆盖 config.obstacle_count；None 用默认 1）。'
+                             '>1 时沿必经之路不同 fraction/lateral 排布，观测仍只给最近激活障碍槽位（67 维不变）')
     parser.add_argument('--residual-reg', type=float, default=-1.0,
                         help='D2 残差幅度正则权重（≥0 覆盖 config.reward.residual_reg_w；<0 用默认 0.5）')
     parser.add_argument('--obstacle-w', type=float, default=-1.0,
                         help='D2 障碍接近惩罚权重（≥0 覆盖 config.reward.obstacle_w；<0 用默认 0.5）')
     parser.add_argument('--obstacle-mix-ratio', type=float, default=-1.0,
                         help='D3 §11.4 无障碍混合采样比例（0~1；每 episode 该概率障碍隐藏做纯抓取训练；<0 用 config 默认 0）')
+    parser.add_argument('--scenario-mix', type=str, default='',
+                        help='P3 训练分布（2026-08-27）：per-episode 场景采样 "静态无障,动态目标无障,动态目标+动态障碍"'
+                             ' 概率（如 0.4,0.3,0.3；空=旧机制全跟随全局开关）。选中场景强制覆盖全局开关，'
+                             '需配合 --dynamic-target --obstacle 提供 target_vel_xy/obstacle_vel')
     parser.add_argument('--collision-penalty', type=float, default=None,
                         help='D3 臂-障碍碰撞当步惩罚（有效值 ≤0；0=关闭惩罚；None=用 config 默认 0）')
     parser.add_argument('--collision-max-streak', type=int, default=None,
@@ -138,6 +145,10 @@ def main():
         if args.obstacle_on_path:
             config.grasping.obstacle_enabled = True
             config.grasping.obstacle_on_nominal_path = True
+            # P3 修复（2026-08-27）：on-path 布局 + obstacle_vel>0 时障碍沿轴运动（动态障碍扫过路径），
+            # 否则障碍被钉住成静态——--obstacle-vel 原只在 --obstacle 分支生效（v13_p3 碰撞率 78% 根因之一）。
+            if args.obstacle_vel > 0:
+                config.grasping.obstacle_vel = args.obstacle_vel
         if args.obstacle_pos:
             _xyz = tuple(float(v) for v in args.obstacle_pos.split(','))
             config.grasping.obstacle_fixed_pos = _xyz
@@ -157,10 +168,20 @@ def main():
             config.reward.obstacle_w = args.obstacle_w
         if args.obstacle_mix_ratio >= 0:
             config.grasping.obstacle_mix_ratio = args.obstacle_mix_ratio
+        if args.scenario_mix:
+            _v = tuple(float(x) for x in args.scenario_mix.split(','))
+            if len(_v) != 3:
+                raise SystemExit('--scenario-mix 需要 3 个概率 "静态,动态,动态+障碍"（如 0.4,0.3,0.3）')
+            config.grasping.scenario_mix = _v
+            config.grasping.dynamic_target_enabled = True   # 提供 target_vel_xy 语义；per-episode 采样决定实际激活
+            config.grasping.obstacle_enabled = True
+            logger.info(f"🎯 P3 训练分布已启用：scenario_mix={_v}（静态/动态/动态+障碍）")
         if args.collision_penalty is not None:
             config.grasping.obstacle_collision_penalty = args.collision_penalty
         if args.collision_max_streak is not None:
             config.grasping.obstacle_collision_max_streak = args.collision_max_streak
+        if args.obstacle_count is not None:
+            config.grasping.obstacle_count = args.obstacle_count
         if args.action_mode or args.dynamic_target or args.obstacle or args.obstacle_on_path:
             logger.info(f"🆕 D1/D2 已启用：action_mode={config.grasping.action_mode}, "
                         f"dynamic_target={config.grasping.dynamic_target_enabled}"

@@ -79,7 +79,11 @@ class GraspingConfig:
     # 方案2(2026-08-22): closing 阶段 pad 向 cube 中心 XY 缓慢微调（解决 PPO_92 卡点：
     # 进入 closing 100% 但 closing→closed 仅 18.3%——pad 停的位置差 1-2cm 手指夹不住）
     closing_align_tol: float = 0.005      # 偏差 < 该值(m) 即保持不动（5mm 内手指已能夹住）
-    closing_align_speed: float = 0.02     # 微调限速 (m/s)，每决策步 ~0.8mm，避免挤压撞飞 cube
+    closing_align_speed: float = 0.08     # closing 微调限速 (m/s)。2026-08-27 选项①：0.02→0.08（每决策步 ~3.2mm）。
+                                          # 纯标称（residual+零残差）静态抓取 42%→70%——closing 阶段 pad 快速对正到 cube
+                                          # 中心再合拢（手指合拢 ~10 步内 pad 移动 32mm，3cm 宽触发下也能夹住 4cm cube），
+                                          # 见 docs/2026-08-27_部署分工与最小验证.md §7.3。v11 模型无障碍评估 83.3%（不破坏 RL）。
+                                          # 原 0.02：手指合拢太快、pad 微调来不及对正 → 空闭合重开（PPO_92 卡点同因）。
     # Task3 冲击抑制（见 docs/抓取冲击抑制方案.md）：
     approach_speed_limit: float = 0.12    # pad 距 cube < approach_speed_dist 时末端线速度限幅 (m/s)（对应实机 UR 慢速 Servo 接近）
     approach_speed_dist: float = 0.06     # 接近限速触发距离（pad 中心→cube；仅抓取最后一段限速，避免 home 全程触发）
@@ -144,6 +148,17 @@ class GraspingConfig:
     nominal_approach_speed: float = 0.12    # 标称接近速度上限 (m/s)，≤ v_max 契约 0.125（docs/sim_to_real动力学匹配方案.md）
     nominal_hover_z_offset: float = 0.134   # 标称悬停高度 = 物体上方 pre_grasp_offset_z（pad 对准 cube 中心）
     nominal_gain: float = 3.0               # 标称速度场增益（阻尼引导：远端匀速 v_max，近端线性减速收敛）
+    nominal_horizontal_gain: float = 6.0    # 标称水平(X/Y)对准增益（2026-08-27 选项①：与垂直分离，提高近端水平
+                                            # 收敛精度——纯标称需在触发闭合前把 pad 对正到 <2cm（cube 半宽），
+                                            # 否则手指从 cube 边缘滑过空闭合，见 docs/2026-08-27_部署分工与最小验证.md §7.3）
+    nominal_ik_two_stage: bool = True       # 标称两段轨迹模式（2026-08-27 P2a：90%）。复刻 MoveIt 无碰撞轨迹：
+                                            # 段1 末端先到 cube 正上方高处（水平对齐、不扫过物体），段2 垂直下降到 hover。
+                                            # 单段速度场直插会扫过 cube 撞飞物体（60%→90%），见 §8.3。速度环执行 + RL 残差兼容。
+    nominal_approach_clearance: float = 0.15   # 段1 悬停高度 = hover + 该值（m），保证不碰 cube（cube 高 4cm）
+    nominal_stage_switch_tol: float = 0.02     # 段1→段2 切换阈值（末端距段1目标 < 该值 m）
+    nominal_feedforward_gain: float = 1.0   # 动态目标速度前馈增益（2026-08-27）：v_nominal += k·v_target。
+                                            # 消纯 P 控制对移动目标的稳态跟踪滞后（err≈v_target/gain，
+                                            # 见 docs/2026-08-27_部署分工与最小验证.md §4.1）
 
     # --- D1 动态目标（L2 激活；L1 静止占位）---
     # 物体位置可 per-step 更新（运动学 qpos 写入，z 固定桌面高度 object_rest_z）
@@ -157,12 +172,28 @@ class GraspingConfig:
     # （不参与碰撞），环境激活时运行时改 contype=1 并移动到 obstacle_fixed_pos——
     # 开关切换不返工（一周冲刺方案 §4.1）。
     obstacle_enabled: bool = False          # 是否启用障碍物
+    obstacle_count: int = 1                 # v12: 激活的静态障碍数量（≤ XML 提供的 body 数 obstacle/obstacle_2/obstacle_3）
+                                            #     多个障碍沿标称路径不同 fraction/lateral 排布；观测仍只给"最近激活障碍"槽位
+                                            #     （67 维不变，兼容旧模型 warm-start）
     obstacle_fixed_pos: Tuple[float, float, float] = (0.06, 0.40, 0.35)  # 固定障碍位置（桌面上的球，球底=桌面顶0.30）
     obstacle_vel: float = 0.0               # 障碍移动速度 (m/s)；0=静态障碍（L1）
     obstacle_axis: str = "y"                # 移动方向轴：'x' 或 'y'
     obstacle_radius: float = 0.05           # 障碍半径 (m)（与 XML geom size 一致）
     obstacle_mass: float = 0.5              # 障碍质量 (kg)（与 XML geom mass 一致）
     obstacle_hidden_pos: Tuple[float, float, float] = (1.0, 1.0, 1.0)  # 未启用时放置处（远离场景，不参与碰撞）
+    # P3 修复（2026-08-27，用户观察"动态障碍竖直掉落/像静态"）：动态障碍（obstacle_vel>0）改为
+    # 横向往返三角波运动（沿 obstacle_axis，锚点 ±obstacle_half_range），z 每子步钉住——消除
+    # freejoint 重力颠簸（视觉掉落）+ 直线飞走 + 0.05m/s 看似静止的缺陷。
+    obstacle_period: float = 4.0            # 横向往返周期 (s)
+    obstacle_half_range: float = 0.12       # 横向往返半幅 (m)（覆盖路径 ±侧偏，障碍反复扫过）
+    # P3 修复 2（2026-08-27，用户要求"在桌面上随机移动"）：随机游走模式。
+    # 'random'=桌面 XY 随机游走（方向每 obstacle_dir_change 秒随机变，边界反弹，z 钉住）；
+    # 'roundtrip'=固定轴往返（上面 obstacle_period/half_range）。
+    obstacle_motion_mode: str = 'random'
+    obstacle_dir_change: float = 2.0        # random 模式：随机改方向间隔 (s)
+    obstacle_wander_bounds: Tuple[Tuple[float, float], Tuple[float, float]] = (
+        (-0.18, 0.15),   # X 游走范围（workspace_bounds ±0.03 margin）
+        (0.28, 0.48))    # Y 游走范围
 
     # --- D2 静态障碍绕障（一周冲刺方案 §5；架构文档 §5.3）---
     # "放标称必经之路"：障碍按当前目标位置自动放在 home→pre-grasp 线段上（reset 时计算），
@@ -173,6 +204,12 @@ class GraspingConfig:
     # 防止残差策略在绕障训练中把已学抓取技能覆盖（v5 失败 episode r_obstacle=-66.8 的实证——
     # 只有 70% 绕障样本时旧技能被冲刷）。0=全激活（保持旧行为/check 脚本）；D3 训练传 0.3。
     obstacle_mix_ratio: float = 0.0
+    # P3 训练分布（2026-08-27，实习项目 Week1）：per-episode 场景类型采样（None=旧机制
+    # 全跟随全局开关，兼容 check_d1/check_d2）。三元组 = (静态无障, 动态目标无障, 动态目标+动态障碍)
+    # 概率（归一化）。P3 训练传 (0.4, 0.3, 0.3)：40% 静态（残差→0 防漂移）+ 30% 动态目标（学追踪修正）
+    # + 30% 动态目标+动态障碍（学综合修正）。选中的场景**强制覆盖**全局开关（dynamic_target_enabled/
+    # obstacle_enabled 仍需配合 CLI 开启以提供 target_vel_xy/obstacle_vel 等参数）。
+    scenario_mix: Tuple[float, float, float] = None
     obstacle_path_fraction: float = 0.5      # 沿线段的放置比例（0=home 端，1=pre-grasp 端，0.5=中点）
     obstacle_path_lateral: float = 0.0       # 侧偏(m，相对路径 XY 法向；>0 向 +y 侧，<0 向 -y 侧，0=正落路径）
     # D3 v8（2026-08-25）：每-episode 障碍侧偏随机化区间（m）。默认 (0.0, 0.0)=固定。
@@ -317,7 +354,7 @@ class RewardConfig:
     # 残差幅度正则（仅 residual 模式；delta 模式 env 传 residual_norm=0 → 恒 0）：
     #   r_residual = -residual_reg_w * ||Δv||²     （L2 鼓励小残差：静态场景 Δv≈0，动态才出手——
     #   对应"残差幅度统计：静态小/动态大"架构分工，见 nominal_trajectory.py / 混合控制架构设计.md）
-    obstacle_w: float = 0.5        # 障碍接近惩罚权重（d=0 时惩罚 -0.5/步）
+    obstacle_w: float = 1        # 障碍接近惩罚权重（d=0 时惩罚 -0.5/步）
     obstacle_range: float = 0.15   # 接近惩罚触发距离(m)（末端→障碍表面 > 该距离 → r_obstacle=0）
     residual_reg_w: float = 0.5    # 残差幅度正则权重（||Δv||=0.125 上限时约 -0.0078/步，温和不淹没抓取信号）
 
