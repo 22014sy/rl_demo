@@ -105,6 +105,10 @@ def main():
                         help='D3 臂-障碍碰撞当步惩罚（有效值 ≤0；0=关闭惩罚；None=用 config 默认 0）')
     parser.add_argument('--collision-max-streak', type=int, default=None,
                         help='D3 连续碰撞步数阈值→truncated（0=禁用；>0 启用；None=用 config 默认 0）')
+    parser.add_argument('--perception-noise-std', type=float, default=-1.0,
+                        help='D6 感知噪声（2026-08-28）：训练时目标位置观测加噪 σ(m)（鲁棒化训练；<0 用 config 默认 0）')
+    parser.add_argument('--perception-dropout', type=float, default=-1.0,
+                        help='D6 感知噪声：训练时随机漏检概率（鲁棒化训练；<0 用 config 默认 0）')
     args = parser.parse_args()
 
     print("=" * 80)
@@ -192,6 +196,14 @@ def main():
             config.grasping.obstacle_collision_max_streak = args.collision_max_streak
         if args.obstacle_count is not None:
             config.grasping.obstacle_count = args.obstacle_count
+        # D6 感知噪声（2026-08-28）：训练时加噪鲁棒化（观测通道目标位置加噪 + 漏检）
+        if args.perception_noise_std >= 0:
+            config.grasping.perception_noise_std = args.perception_noise_std
+        if args.perception_dropout >= 0:
+            config.grasping.perception_dropout = args.perception_dropout
+        if config.grasping.perception_noise_std > 0 or config.grasping.perception_dropout > 0:
+            logger.info(f"🎭 D6 感知噪声训练已启用：noise_std={config.grasping.perception_noise_std} m, "
+                        f"dropout={config.grasping.perception_dropout}（鲁棒化）")
         if args.action_mode or args.dynamic_target or args.obstacle or args.obstacle_on_path:
             logger.info(f"🆕 D1/D2 已启用：action_mode={config.grasping.action_mode}, "
                         f"dynamic_target={config.grasping.dynamic_target_enabled}"

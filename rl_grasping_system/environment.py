@@ -113,6 +113,10 @@ class GraspingEnv(gym.Env):
         # D1: 当前标称参考速度（观测槽位；delta 模式恒 0，residual 模式每决策步刷新）
         self._v_nominal = np.zeros(6)
 
+        # D6 感知噪声（2026-08-28）：目标位置感知估计（真值+高斯噪声+漏检零阶保持），
+        # 仅污染观测通道（感知-控制双通道隔离）；None=首次用真值
+        self._perceived_pos = None
+
         # 重置环境
         self.reset()
     
@@ -367,6 +371,9 @@ class GraspingEnv(gym.Env):
         self._dyn_target_base_xy = object_pos[:2].copy()
         # 2026-08-27: 目标速度（标称前馈用；L1 静止恒 0，L2 由 _update_dynamic_target 维护）
         self._dyn_target_vel = np.zeros(3)
+
+        # D6 感知噪声：episode 起始感知估计 = 真值（首次不落后，避免初始化偏差）
+        self._perceived_pos = None
         
         # 重置episode监控
         self.episode_start_time = time.time()
@@ -1390,10 +1397,38 @@ class GraspingEnv(gym.Env):
                     total += abs(float(self.data.efc_force[c.efc_address]))
         return total
     
+    def _perceived_target_pos(self) -> np.ndarray:
+        """D6 感知噪声：目标位置的感知估计（仅观测通道）。
+
+        物理真值（self.target_pos，自由关节承载）+ 高斯噪声（模拟相机深度反投影误差）
+        + 随机漏检（YOLO/tracker 丢帧 → 零阶保持上次估计）。奖励/物理位置仍用真值
+        （感知-控制双通道隔离，隔离变量：只换观测，量化策略感知容忍度）。
+        """
+        std = float(getattr(self.grasping_config, 'perception_noise_std', 0.0))
+        dropout = float(getattr(self.grasping_config, 'perception_dropout', 0.0))
+        true = self.target_pos.copy()
+        if std <= 0.0 and dropout <= 0.0:
+            return true
+        if self._perceived_pos is None:
+            # 首次（reset 后）：以当前真值+噪声为初始估计，避免初始化偏差
+            est = true + self.np_random.normal(0.0, std, 3) if std > 0.0 else true.copy()
+        else:
+            est = self._perceived_pos.copy()  # 默认零阶保持（漏检语义）
+            if float(self.np_random.uniform()) >= dropout:
+                est = true + self.np_random.normal(0.0, std, 3)  # 正常检测：真值+噪声
+        self._perceived_pos = est.copy()
+        return est.copy()
+
     def _get_observation(self) -> np.ndarray:
         """组合本体感知状态为 67 维观测向量（D1：观测空间第一天即最终形态）"""
         # 获取本体感知状态
         state = get_proprioceptive_state(self.data, self.model, self)
+
+        # D6 感知噪声：仅污染观测通道的 target_position（感知-控制双通道隔离——
+        # 奖励/物理位置仍读 self.target_pos 真值，见 state.py:125 与 step 内奖励计算）
+        if (float(getattr(self.grasping_config, 'perception_noise_std', 0.0)) > 0.0
+                or float(getattr(self.grasping_config, 'perception_dropout', 0.0)) > 0.0):
+            state['target_position'] = self._perceived_target_pos()
 
         # P2-2: 相对接近姿态四元数 —— 从当前手姿态转到目标抓取姿态的旋转（在手坐标系表达）。
         # 目标抓取姿态 = 物体朝向(target_orientation) ⊗ 朝下接近旋转(Q_APPROACH_DOWN)，

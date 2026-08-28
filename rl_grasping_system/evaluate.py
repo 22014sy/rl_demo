@@ -347,6 +347,10 @@ def main():
     parser.add_argument('--zero-residual', action='store_true',
                         help='2026-08-28 消融对比：动作恒 0（--action-mode residual 下 = 纯标称，'
                              'MoveIt 标称仿真替身无 RL 修正，三路对比 baseline）')
+    parser.add_argument('--perception-noise-std', type=float, default=0.0,
+                        help='D6 感知噪声：目标位置高斯噪声标准差 (m)（模拟相机深度反投影误差）')
+    parser.add_argument('--perception-dropout', type=float, default=0.0,
+                        help='D6 感知噪声：随机漏检概率 (0~1)（漏检时目标估计零阶保持上次值）')
     
     args = parser.parse_args()
     
@@ -402,6 +406,11 @@ def main():
             config.grasping.target_vel_xy = args.target_vel
         if args.target_axis:
             config.grasping.target_motion_axis = args.target_axis
+        # D6 感知噪声（2026-08-28）：观测通道目标位置加噪 + 漏检（感知-控制双通道隔离）
+        if args.perception_noise_std > 0:
+            config.grasping.perception_noise_std = args.perception_noise_std
+        if args.perception_dropout > 0:
+            config.grasping.perception_dropout = args.perception_dropout
         # 物体位置：默认固定（对齐 train_with_monitor 无 --position-random 的行为）；
         # --position-random 时围绕 object_fixed_pos ±radius 随机（收窄 workspace_bounds）
         if args.position_random:
