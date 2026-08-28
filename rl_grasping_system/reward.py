@@ -68,7 +68,7 @@ def orientation_align(q_hand, q_target):
 # orient_align、z_axis_z 也算进奖励，而 z_axis_z=“手指朝上+1/朝下−1”，等于把 P1.2
 # 修复掉的反向信号以系数 1 重新注入奖励——这正是方向项修了却不见效的原因之一）。
 REWARD_KEYS = ('r_dist_xy', 'r_dist_z', 'r_orient', 'r_contact', 'r_close', 'r_grasp', 'r_success',
-               'r_obstacle', 'r_residual', 'r_step')
+               'r_obstacle', 'r_residual', 'r_avoid', 'r_step')
 
 
 def _anchor_boost(w, d, d_target):
@@ -224,6 +224,14 @@ def reward_breakdown(state, prev_state, grasp_info, reward_config=None):
     # D2: 障碍接近惩罚 + 残差幅度正则（在 r_step 后统一写入；事件分支不覆盖——接近惩罚全程生效）
     parts['r_obstacle'] = _r_obstacle
     parts['r_residual'] = _r_residual
+    # v16 奖励经济学：干净成功奖励——抓取成功当步若全程 0 碰撞 → +obstacle_clear_bonus
+    # （上升沿一次性发放；碰撞累计由 env 传 grasp_info['obstacle_collision_count']）。
+    # 经济学：让"绕开障碍再抓取"(+100+bonus) 严格优于"穿障成功"(+100) → 主动绕障。
+    _r_avoid = 0.0
+    if grasp_info.get('grasp_success_rising', False):
+        _r_avoid = float(getattr(reward_config, 'obstacle_clear_bonus', 0.0)) if \
+            int(grasp_info.get('obstacle_collision_count', 0)) == 0 else 0.0
+    parts['r_avoid'] = _r_avoid
 
     # 纯诊断键（不进入 calculate_reward 的和）
     parts['diag'] = {

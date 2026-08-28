@@ -1,6 +1,32 @@
 # 强化学习抓取系统
 
-这是一个独立的、基于强化学习的机械臂抓取系统，专门用于训练Panda机械臂执行"到达并抓取"任务。
+这是一个独立的、基于强化学习的机械臂抓取系统，采用**混合残差架构**（MoveIt 标称轨迹 + PPO 残差修正）
+训练 UR5e + Robotiq 2F-85 执行"到达并抓取"任务（MuJoCo 仿真，动态目标 + 动态障碍避障）。
+
+## 📊 核心结果：三路消融对比（2026-08-28）
+
+混合残差架构（`v = v_nominal(t) + Δv`）在三类场景下**均优于**端到端 PPO 与纯标称（零残差）：
+
+| 场景 | 端到端 PPO | 残差 PPO | 纯标称（零残差） |
+|---|---|---|---|
+| 静态无障 | 26.7% | **100%** | 83.3% |
+| 动态目标（0.05 m/s） | 63.3% | **90.0%** | 66.7% |
+| 动态目标 + 动态障碍 | 43.3% | **86.7%** | 70.0% |
+
+![三路消融对比](results/ablation_compare.png)
+
+**结论**（失败归因详见 `docs/2026-08-27_RL训练失败分析_v5到v12b.md`、`docs/2026-08-28_RL训练失败分析_v19v20_碰撞经济学过冲.md`）：
+- **标称解决静态**：纯标称静态 83.3%——静态任务无需 RL 即可完成大部分，RL 只补偏差
+- **残差解决动态**：动态场景残差 90%/86.7%，大幅领先纯标称 66.7%/70%——"RL 学偏差"优于"RL 重学任务"
+- **端到端均不如残差**：端到端全场景最差（8 版端到端失败归因 = 任务分解 / 奖励经济学问题）
+- **域变化鲁棒性**：三路均未在当前环境（扩大桌面 0.70m）重训，端到端对域变化最敏感（静态跌到 26.7%）、
+  残差最鲁棒（静态仍 100%）——残差受域差影响小，契合 sim2real（`docs/sim_to_real动力学匹配方案.md`）
+
+**复现**：
+```bash
+bash scripts/run_ablation.sh     # 三路 × 三场景 × n=30 评估 → results/ablation/*.json
+python scripts/plot_ablation.py  # 生成 results/ablation_compare.png 对比图
+```
 
 ## 系统特点
 
@@ -317,11 +343,15 @@ rl_grasping_system/
 ├── vec_normalize_wrapper.py   # 归一化包装器
 ├── train_cloud.py            # 云端训练脚本
 ├── train_with_monitor.py     # 本地训练脚本
-├── evaluate.py               # 模型评估
+├── evaluate.py               # 模型评估（--zero-residual 支持纯标称评估）
 ├── singularity_handler.py    # 奇异点处理
 ├── action_wrapper.py         # 动作安全包装
 ├── state.py                  # 状态处理
 ├── reward.py                 # 奖励函数
+├── scripts/
+│   ├── run_ablation.sh       # 三路消融评估（端到端/残差/纯标称 × 3 场景）
+│   ├── plot_ablation.py      # 消融对比图生成
+│   └── ...                   # 更多验证/诊断脚本
 ├── requirements.txt          # 依赖列表
 └── README.md                # 本文件
 ```

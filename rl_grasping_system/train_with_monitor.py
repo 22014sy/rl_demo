@@ -89,6 +89,12 @@ def main():
                         help='D2 残差幅度正则权重（≥0 覆盖 config.reward.residual_reg_w；<0 用默认 0.5）')
     parser.add_argument('--obstacle-w', type=float, default=-1.0,
                         help='D2 障碍接近惩罚权重（≥0 覆盖 config.reward.obstacle_w；<0 用默认 0.5）')
+    parser.add_argument('--obstacle-clear-bonus', type=float, default=-1.0,
+                        help='v16 奖励经济学：干净成功奖励（≥0 覆盖 config.reward.obstacle_clear_bonus；'
+                             '抓取成功当步全程 0 碰撞 → +bonus，让绕障抓取优于穿障抓取；<0 用默认 0）')
+    parser.add_argument('--max-steps', type=int, default=-1,
+                        help='v17+ 每 episode 抬升前最大步数（覆盖 config.grasping.max_steps；'
+                             '双障碍绕行需更多时间，200→250 可救超时失败；<0 用默认 200）')
     parser.add_argument('--obstacle-mix-ratio', type=float, default=-1.0,
                         help='D3 §11.4 无障碍混合采样比例（0~1；每 episode 该概率障碍隐藏做纯抓取训练；<0 用 config 默认 0）')
     parser.add_argument('--scenario-mix', type=str, default='',
@@ -166,6 +172,10 @@ def main():
             config.reward.residual_reg_w = args.residual_reg
         if args.obstacle_w >= 0:
             config.reward.obstacle_w = args.obstacle_w
+        if args.obstacle_clear_bonus >= 0:
+            config.reward.obstacle_clear_bonus = args.obstacle_clear_bonus
+        if args.max_steps >= 0:
+            config.grasping.max_steps = int(args.max_steps)
         if args.obstacle_mix_ratio >= 0:
             config.grasping.obstacle_mix_ratio = args.obstacle_mix_ratio
         if args.scenario_mix:

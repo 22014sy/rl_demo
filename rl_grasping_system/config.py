@@ -118,10 +118,12 @@ class GraspingConfig:
     lift_tol: float = 0.015        # 到达目标高度的容差 (m)
     lift_max_steps: int = 700      # 抬升阶段最长步数（防死循环；0.003 到 0.2m 实测需 ~494 步）
 
-    # 工作空间配置 - 围绕XML中的物体位置设计（Task3: UR5e + cube@(-0.134, 0.492, 0.32)）
+    # 工作空间配置 - 围绕XML中的物体位置设计（Task3: UR5e + cube@(0.1, 0.42, 0.32)）
+    # 2026-08-28 扩大：X (-0.15,0.1)→(-0.18,0.13)、Y (0.32,0.42)→(0.26,0.42)（面积约 +90%）。
+    #   从 home 位形 DLS-IK 打点 100% 可达（决策记录 docs/2026-08-28_深度相机分工与桌面扩大眼在手外.md）。
     workspace_bounds: Tuple[Tuple[float, float], Tuple[float, float], Tuple[float, float]] = (
-        (-0.15, 0.1),   # X轴范围（IK 直接设位模式在距 base>~0.45 处 pad 夹偏；cube 固定 0.51 走速度模式）
-        (0.32, 0.42),   # Y轴范围（max dist≈0.45）
+        (-0.18, 0.13),  # X轴范围（原 (-0.15, 0.1)；IK 直接设位模式在距 base>~0.45 处 pad 夹偏，速度模式增量逼近不受限）
+        (0.26, 0.42),   # Y轴范围（原 (0.32, 0.42)；下界外扩至 0.26，仍在桌面内）
         (0.25, 0.6)     # Z轴范围 (围绕rq_base_mount home z≈0.48)
     )
 
@@ -131,6 +133,23 @@ class GraspingConfig:
     object_fixed_pos: Tuple[float, float] = (0.1, 0.42)  # Task3: cube 桌面水平位置（换位后；原 -0.134,0.492 对齐 home pinch）
     object_rest_z: float = 0.32  # Task3: 物体落定高度 = 桌面顶(0.30) + 半边长(0.02)；Panda 桌面在 z=0 时原为 0.02
     table_top_z: float = 0.30    # Task3: 桌面顶面高度（初始位形防碰撞校验用）
+    # ============================================================
+    # 2026-08-28 桌面扩大 + 深度相机（眼在手外 eye-to-hand）
+    # ============================================================
+    # 桌面（MJCF ur5e_robotiq_cube.xml）：半边长 0.24→0.35（0.70m 见方），中心 (0.1, 0.42)→(0.1, 0.53)
+    #   （保持 Y 下界 0.18 不碰下臂，历史教训见 docs/DEV_LOG.md）；顶面 z=0.30 不变。
+    #   工作区中心 = object_fixed_pos (0.1, 0.42) = 眼在手外相机的对准点。
+    table_half_size: float = 0.35
+    table_center: Tuple[float, float] = (0.1, 0.53)
+    # 深度相机（眼在手外）：固定在工作区正上方、垂直向下看，不随机械臂运动（区别于 eye-in-hand）。
+    #   对应部署侧 RealSense D435i 支架布局；训练端 mujoco.Renderer 渲染等价深度图
+    #   （environment.get_depth_image），两端感知特征同构（决策记录 docs/2026-08-28_...）。
+    camera_name: str = "eye_to_hand"
+    camera_width: int = 640
+    camera_height: int = 480
+    camera_fovy: float = 60.0    # 垂直视场角（°），与 XML <camera fovy> 一致
+    depth_enabled: bool = False  # 感知改造 Phase 2 启用深度渲染（默认关 = 无渲染开销）
+    depth_max_clip: float = 5.0  # 深度裁剪上限 (m)，> 该值置 0（远背景清零）
     # ============================================================
     # D1（2026-08-24，一周冲刺方案 §5）残差策略 + 动态化环境地基
     # 目标：L1 静态闭环（MoveIt 标称 + RL 残差绕障抓取）的地基第一天就位，
@@ -192,8 +211,8 @@ class GraspingConfig:
     obstacle_motion_mode: str = 'random'
     obstacle_dir_change: float = 2.0        # random 模式：随机改方向间隔 (s)
     obstacle_wander_bounds: Tuple[Tuple[float, float], Tuple[float, float]] = (
-        (-0.18, 0.15),   # X 游走范围（workspace_bounds ±0.03 margin）
-        (0.28, 0.48))    # Y 游走范围
+        (-0.22, 0.18),   # X 游走范围（2026-08-28 随 workspace 扩大，桌面内 X∈[-0.25,0.45]）
+        (0.22, 0.50))    # Y 游走范围（2026-08-28 随 workspace 扩大，桌面内 Y∈[0.18,0.88]）
 
     # --- D2 静态障碍绕障（一周冲刺方案 §5；架构文档 §5.3）---
     # "放标称必经之路"：障碍按当前目标位置自动放在 home→pre-grasp 线段上（reset 时计算），
@@ -356,6 +375,12 @@ class RewardConfig:
     #   对应"残差幅度统计：静态小/动态大"架构分工，见 nominal_trajectory.py / 混合控制架构设计.md）
     obstacle_w: float = 1        # 障碍接近惩罚权重（d=0 时惩罚 -0.5/步）
     obstacle_range: float = 0.15   # 接近惩罚触发距离(m)（末端→障碍表面 > 该距离 → r_obstacle=0）
+    # v16 奖励经济学（2026-08-28，用户要求"注意奖励经济学设计"）：
+    #   obstacle_clear_bonus——"干净成功"一次性奖励：抓取成功当步若全程 0 碰撞 → +bonus。
+    #   经济学：v15 穿障成功仍净赚（collision -5×10=-50 < 成功 +120）；该 bonus 让"绕开障碍
+    #   再抓取"成为独立正收益（+100+30）vs 穿障成功（+100 无 bonus）→ 引导策略主动绕障而非贴边。
+    #   默认 0 保持旧行为（旧模型/旧训练不引入额外奖励，避免观测口径漂移）。
+    obstacle_clear_bonus: float = 0.0
     residual_reg_w: float = 0.5    # 残差幅度正则权重（||Δv||=0.125 上限时约 -0.0078/步，温和不淹没抓取信号）
 
 @dataclass

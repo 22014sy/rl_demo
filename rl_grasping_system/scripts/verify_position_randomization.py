@@ -31,8 +31,8 @@ from verify_grasp_feasibility import (
 )
 
 # 与 config.GraspingConfig.workspace_bounds 保持一致（X/Y 采样范围；Z 由落定高度决定，不采样）
-# Task3 (UR5e): 与 config.workspace_bounds 一致
-DEFAULT_BOUNDS = ((-0.15, 0.1), (0.32, 0.42), (0.25, 0.6))
+# Task3 (UR5e): 与 config.workspace_bounds 一致（2026-08-28 桌面扩大后同步：X(-0.18,0.13)、Y(0.26,0.42)）
+DEFAULT_BOUNDS = ((-0.18, 0.13), (0.26, 0.42), (0.25, 0.6))
 REST_Z = 0.32  # Task3: 物体落定高度 = 桌面顶(0.30)+半边长(0.02)
 
 

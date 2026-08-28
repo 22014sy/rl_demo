@@ -59,7 +59,7 @@ def load_model(model_path: str, config):
     return agent, env
 
 def run_episode(agent, env, render: bool = False, max_steps: int = 500,
-                deterministic: bool = True):
+                deterministic: bool = True, zero_residual: bool = False):
     """运行单个episode"""
     obs, _ = env.reset()
     episode_reward = 0
@@ -70,7 +70,12 @@ def run_episode(agent, env, render: bool = False, max_steps: int = 500,
     
     while episode_length < max_steps:
         # 预测动作（2026-08-24：加 deterministic 参数，供位置迁移诊断测量随机策略成功率）
-        action, _ = agent.predict(obs, deterministic=deterministic)
+        # 2026-08-28 消融对比：--zero-residual 时动作恒 0 —— residual 模式下
+        # v = v_nominal(t) + 0 = 纯标称（MoveIt 标称仿真替身，无 RL 修正），三路对比的 baseline 之一。
+        if zero_residual:
+            action = np.zeros(env.action_space.shape, dtype=np.float32)
+        else:
+            action, _ = agent.predict(obs, deterministic=deterministic)
         
         # 执行动作
         obs, reward, terminated, truncated, info = env.step(action)
@@ -110,7 +115,8 @@ def run_episode(agent, env, render: bool = False, max_steps: int = 500,
         'episode_info': episode_info
     }
 
-def evaluate_model(agent, env, n_episodes: int = 50, render: bool = False):
+def evaluate_model(agent, env, n_episodes: int = 50, render: bool = False,
+                   zero_residual: bool = False):
     """评估模型性能"""
     logger = logging.getLogger(__name__)
     
@@ -122,7 +128,7 @@ def evaluate_model(agent, env, n_episodes: int = 50, render: bool = False):
     for episode in range(n_episodes):
         logger.info(f"运行episode {episode + 1}/{n_episodes}")
         
-        episode_result = run_episode(agent, env, render=render)
+        episode_result = run_episode(agent, env, render=render, zero_residual=zero_residual)
         results.append(episode_result)
         
         if episode_result['grasp_success']:
@@ -314,6 +320,10 @@ def main():
                         help='D2 固定障碍位置 "x,y,z"（与 --obstacle-on-path 二选一）')
     parser.add_argument('--obstacle-w', type=float, default=-1.0,
                         help='D2 障碍接近惩罚权重（<0 用 config 默认）')
+    parser.add_argument('--obstacle-clear-bonus', type=float, default=-1.0,
+                        help='v16 干净成功奖励（<0 用 config 默认；仅影响 reward 数值口径，评估指标不受影响）')
+    parser.add_argument('--max-steps', type=int, default=-1,
+                        help='v17+ 每 episode 抬升前最大步数（覆盖 config.grasping.max_steps；<0 用默认 200）')
     parser.add_argument('--residual-reg-w', type=float, default=-1.0,
                         help='D2 残差幅度正则权重（<0 用 config 默认）')
     parser.add_argument('--obstacle-mix-ratio', type=float, default=-1.0,
@@ -334,6 +344,9 @@ def main():
                         help='P3 动态目标速度 (m/s)（>=0 覆盖 config.target_vel_xy；<0 用默认 0）')
     parser.add_argument('--target-axis', type=str, default='',
                         help='P3 动态目标运动轴（空=用 config.target_motion_axis）')
+    parser.add_argument('--zero-residual', action='store_true',
+                        help='2026-08-28 消融对比：动作恒 0（--action-mode residual 下 = 纯标称，'
+                             'MoveIt 标称仿真替身无 RL 修正，三路对比 baseline）')
     
     args = parser.parse_args()
     
@@ -361,6 +374,10 @@ def main():
             config.grasping.obstacle_enabled = True
         if args.obstacle_w >= 0:
             config.reward.obstacle_w = args.obstacle_w
+        if args.obstacle_clear_bonus >= 0:
+            config.reward.obstacle_clear_bonus = args.obstacle_clear_bonus
+        if args.max_steps >= 0:
+            config.grasping.max_steps = int(args.max_steps)
         if args.residual_reg_w >= 0:
             config.reward.residual_reg_w = args.residual_reg_w
         if args.obstacle_mix_ratio >= 0:
@@ -410,7 +427,8 @@ def main():
         agent, env = load_model(args.model_path, config)
         
         # 评估模型
-        results = evaluate_model(agent, env, args.n_episodes, args.render)
+        results = evaluate_model(agent, env, args.n_episodes, args.render,
+                                 zero_residual=args.zero_residual)
         
         # 绘制结果
         plot_results(results, args.save_plot)

@@ -259,9 +259,11 @@
     </body>
 
   <!-- ===== 桌面(固定) + 目标立方体（Task3: UR5e+2F-85 抓取场景） =====
-       桌面为固定 body（不可加 freejoint，否则会被接触力推移导致 cube 穿桌） -->
-  <body name="table" pos="0.100000 0.420000 0.275000">
-    <geom type="box" size="0.240000 0.240000 0.025000" rgba="0.55 0.55 0.55 1"
+       桌面为固定 body（不可加 freejoint，否则会被接触力推移导致 cube 穿桌）
+       2026-08-28 桌面扩大：半边长 0.24→0.35、中心 Y 0.42→0.53（下界保持 0.18 不碰下臂）。
+       workspace_bounds 同步扩大，IK 打点见 docs/2026-08-28_深度相机分工与桌面扩大眼在手外.md -->
+  <body name="table" pos="0.100000 0.530000 0.275000">
+    <geom type="box" size="0.350000 0.350000 0.025000" rgba="0.55 0.55 0.55 1"
       friction="0.8 0.5 0.02" solimp="0.99 0.995 0.001" solref="0.01 1"/>
   </body>
   <body name="target_cube" pos="0.100000 0.420000 0.320000">
@@ -269,6 +271,18 @@
       friction="0.6 0.4 0.02" mass="0.1" solimp="0.99 0.995 0.001" solref="0.01 1"/>
     <freejoint/>
   </body>
+
+  <!-- ===== 眼在手外深度相机（2026-08-28，eye-to-hand） =====
+       相机固定在工作区正上方、垂直向下看抓取工作区中心 (0.1, 0.42, 0.30)，
+       不随机械臂运动（区别于 eye-in-hand）。mode="track"：位置 pos 固定（世界系），
+       朝向自动指向 target=cam_target（不可见靶标 body）——MuJoCo 3.10 已验证。
+       对应部署侧 RealSense D435i 支架布局；训练端用 mujoco.Renderer 渲染等价深度图，
+       两端感知特征同构（决策记录 docs/2026-08-28_深度相机分工与桌面扩大眼在手外.md）。 -->
+  <body name="cam_target" pos="0.100000 0.420000 0.300000">
+    <geom type="sphere" size="0.001" rgba="0 0 0 0" contype="0" conaffinity="0"/>
+  </body>
+  <camera name="eye_to_hand" mode="track" target="cam_target"
+          pos="0.100000 0.420000 1.200000" fovy="60"/>
 
   <!-- ===== 动态障碍物（D1 地基：freejoint 可编程运动，step 内 qvel 赋值） =====
        一周冲刺方案 §4.1：障碍物 body 加 freejoint + step 内 qvel 赋值——

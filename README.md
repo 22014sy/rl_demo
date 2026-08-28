@@ -55,6 +55,9 @@ robotic_arm_control/
 - **模型验证**: 检查模型配置和视觉支持能力
 
 ### 3. 强化学习抓取系统
+- **混合残差架构**: MoveIt 标称轨迹 + PPO 残差修正（v = v_nominal + Δv），UR5e+Robotiq 动态抓取/避障
+- **消融验证**: 三路对比（端到端/残差/纯标称 × 3 场景，n=30）——静态 100%、动态目标 90%、
+  动态+障碍 86.7%，残差全场景最优；对比图见 `rl_grasping_system/results/ablation_compare.png`
 - **独立模块**: 完全独立的抓取系统，不影响现有PID控制系统
 - **PPO算法**: 基于Stable-Baselines3的PPO实现
 - **归一化技术**: 观察归一化、奖励归一化、优势函数归一化
@@ -116,6 +119,8 @@ python train_cloud.py
 - [x] UR5e机械臂PID控制系统
 - [x] VLM诊断系统完整实现
 - [x] 独立RL抓取系统架构
+- [x] 混合残差架构（MoveIt 标称 + PPO 残差）动态抓取/避障
+- [x] 三路消融对比实验（端到端 vs 残差 vs 纯标称）与对比图
 - [x] PPO智能体实现
 - [x] 归一化技术集成
 - [x] 云端训练支持

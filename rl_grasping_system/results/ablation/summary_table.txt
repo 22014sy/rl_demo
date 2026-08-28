@@ -1,0 +1,9 @@
+| Scenario | End-to-end SR | Residual SR | Nominal SR | E2E collision | Resid collision | Nom collision |
+|---|---|---|---|---|---|---|
+| Static | 26.7% | 100.0% | 83.3% | 0.0% | 0.0% | 0.0% |
+| Dynamic target | 63.3% | 90.0% | 66.7% | 0.0% | 0.0% | 0.0% |
+| Dynamic target + obstacle | 43.3% | 86.7% | 70.0% | 23.3% | 23.3% | 20.0% |
+
+Models: end2end = v11_500k (delta, no nominal); residual = v18_p3f (residual, product model); nominal = v18_p3f + zero residual (nominal-only).
+Setup: n=30 per scenario, fixed object pose, same current env (enlarged table 0.70m), none retrained in current env.
+Conclusion: nominal suffices for static (83.3%), residual dominates dynamic scenarios, end-to-end worst everywhere.

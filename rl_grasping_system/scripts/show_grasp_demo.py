@@ -166,6 +166,8 @@ def main():
                     help="俯拍视角（桌面正上方垂直向下；默认绕竖直轴转 180° 对面拍摄）")
     ap.add_argument("--dual", action="store_true",
                     help="双视角同屏拼接：斜视(左) + 俯拍(右) 水平拼接，一张 GIF 同时看动作与布局")
+    ap.add_argument("--dual-side", action="store_true",
+                    help="双视角右栏改用侧面近景（2026-08-28）：左特写/俯拍 + 右侧面近距离观察夹爪-障碍间隙")
     ap.add_argument("--triple", action="store_true",
                     help="三视图同屏（2026-08-27）：特写(左) + 俯拍(中) + 侧面碰撞观察(右)，"
                          "右侧面近景可看清夹爪与障碍的间隙/接触")
@@ -285,7 +287,12 @@ def main():
                     _set_oblique_camera(renderer, lookat_xy=(cx, cy))   # 左：低平视角
                 img_left = renderer.render()
                 renderer.update_scene(env.data)
-                _set_topdown_camera(renderer, lookat_xy=(cx, cy))   # 右：俯拍（桌面布局与障碍位置）
+                if args.dual_side:
+                    # 右：侧面近距离观察（2026-08-28）——看夹爪与障碍的间隙/接触（不做黑边裁剪，
+                    # 与默认 dual 一致的满幅渲染 + 直接 hstack，2026-08-28 用户要求）
+                    _set_side_camera(renderer, ee)
+                else:
+                    _set_topdown_camera(renderer, lookat_xy=(cx, cy))   # 右：俯拍（桌面布局与障碍位置）
                 img_right = renderer.render()
                 img = np.hstack([img_left, img_right])              # H x (2W) x 3
             else:

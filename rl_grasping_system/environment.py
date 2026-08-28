@@ -735,6 +735,8 @@ class GraspingEnv(gym.Env):
             # D2: 障碍接近距离 + 残差幅度（奖励惩罚输入；未启用时 inf/0 → r_obstacle/r_residual 恒 0）
             'obstacle_dist': self._get_obstacle_distance(),
             'residual_norm': float(np.linalg.norm(_res_delta)) if self.action_mode == 'residual' else 0.0,
+            # v16 奖励经济学：累计碰撞计数（供 reward_breakdown 发"干净成功"bonus；reset 清零）
+            'obstacle_collision_count': int(self.task_state.get('obstacle_collision_count', 0)),
         }
         # D2/评估：本步残差幅度 ‖Δv‖ 暴露（residual 模式真值；delta/position 恒 0）——
         # 供 evaluate.py 做 §3.5-5「成功=小残差/失败=大残差」分工证据统计
@@ -1631,6 +1633,72 @@ class GraspingEnv(gym.Env):
         except Exception as e:
             self.logger.warning(f"渲染失败: {e}")
             return None
+
+    # ---------- 眼在手外相机（2026-08-28，感知 Phase 2 基础设施） ----------
+    def _get_offscreen_renderer(self, depth: bool):
+        """惰性创建离屏渲染器（眼在手外相机）。
+
+        与 GUI renderer 分离：渲染后端由入口脚本设置（本地 GLFW / 云端 EGL），
+        在调用子进程内首次创建（避免 SubprocVecEnv fork 继承 X 连接）。失败降级 None。
+        """
+        attr = '_depth_renderer' if depth else '_camera_renderer'
+        r = getattr(self, attr, None)
+        if r is not None:
+            return r
+        try:
+            h = int(getattr(self.grasping_config, 'camera_height', 480))
+            w = int(getattr(self.grasping_config, 'camera_width', 640))
+            r = mujoco.Renderer(self.model, h, w)
+            if depth:
+                r.enable_depth_rendering()
+            setattr(self, attr, r)
+        except Exception as e:
+            self.logger.warning(f"{'深度' if depth else 'RGB'}离屏渲染器创建失败"
+                                f"（需 MUJOCO_GL=egl/osmesa 无头后端）: {e}")
+            setattr(self, attr, None)
+        return getattr(self, attr, None)
+
+    def get_depth_image(self, camera: Optional[str] = None) -> Optional[np.ndarray]:
+        """渲染眼在手外深度图（米），返回 (H, W) float32；未启用/失败返回 None。
+
+        与部署侧 RealSense 深度流对应：目标 3D 位置、障碍距离/方向等感知特征从
+        这张深度图提取，训练/部署两端保持同构（决策记录
+        docs/2026-08-28_深度相机分工与桌面扩大眼在手外.md）。
+
+        注意（MuJoCo 3.10 实测）：enable_depth_rendering 后 render() 返回的
+        深度已是**物理距离（米）**，不是 [0,1] 非线性缓冲（中心像素 0.9m =
+        相机到桌面的垂直距离）；因此不做 zbuffer→米 的转换，仅做无效/越界清零。
+        """
+        if not bool(getattr(self.grasping_config, 'depth_enabled', False)):
+            return None
+        r = self._get_offscreen_renderer(depth=True)
+        if r is None:
+            return None
+        cam = camera or str(getattr(self.grasping_config, 'camera_name', 'eye_to_hand'))
+        try:
+            r.update_scene(self.data, camera=cam)
+            depth = np.asarray(r.render(), dtype=np.float32).reshape(r.height, r.width)
+            clip = float(getattr(self.grasping_config, 'depth_max_clip', 5.0))
+            depth[~np.isfinite(depth)] = 0.0
+            depth[depth <= 0.0] = 0.0
+            depth[depth > clip] = 0.0
+            return depth
+        except Exception as e:
+            self.logger.warning(f"深度渲染失败: {e}")
+            return None
+
+    def get_camera_image(self, camera: Optional[str] = None) -> Optional[np.ndarray]:
+        """渲染指定相机（默认眼在手外）RGB 图像，返回 (H, W, 3) uint8；失败返回 None。"""
+        r = self._get_offscreen_renderer(depth=False)
+        if r is None:
+            return None
+        cam = camera or str(getattr(self.grasping_config, 'camera_name', 'eye_to_hand'))
+        try:
+            r.update_scene(self.data, camera=cam)
+            return np.asarray(r.render())
+        except Exception as e:
+            self.logger.warning(f"相机渲染失败: {e}")
+            return None
     
     def close(self):
         """关闭环境"""
@@ -1640,6 +1708,14 @@ class GraspingEnv(gym.Env):
             except Exception:
                 pass
             self.viewer_handle = None
+        for _attr in ('_depth_renderer', '_camera_renderer'):
+            _r = getattr(self, _attr, None)
+            if _r is not None:
+                try:
+                    _r.close()
+                except Exception:
+                    pass
+            setattr(self, _attr, None)
 
 
 # Task3 迁移：兼容别名（旧代码/入口脚本引用 PandaGraspingEnv 时仍可用）
