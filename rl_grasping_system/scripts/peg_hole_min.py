@@ -67,6 +67,7 @@ class PegHoleEnv(gym.Env):
         self.steps = 0
         self.max_steps = 200
         self.T = DT * SUBSTEPS * ACTION_REPEAT
+        self.lateral_range = 0.02  # 初始水平偏移范围(m)：课程 ±2cm；扰动评估可改大（±5cm）
 
     def _set_initial_pose(self):
         """IK 把 peg 尖端放到孔正上方附近（+水平/高度小随机，课程式起点）。
@@ -78,7 +79,7 @@ class PegHoleEnv(gym.Env):
         mujoco.mj_forward(self.model, self.data)
         rng = self.np_random
         tip_target = HOLE_CENTER.copy()
-        tip_target[:2] += rng.uniform(-0.02, 0.02, 2)   # 孔上方 ±2cm 水平随机
+        tip_target[:2] += rng.uniform(-self.lateral_range, self.lateral_range, 2)  # 初始水平偏移
         tip_target[2] += rng.uniform(0.06, 0.10)        # 孔上方 6~10cm
         ee_target = tip_target + np.array([0.0, 0.0, PEG_TIP_OFFSET])
         q, err = ik.solve_ik(self.model, self.data, self.ee_id, ee_target,
@@ -188,6 +189,9 @@ def main():
     print(f'success_rate={sr0*100:.1f}%  avg_insertion={d0*1000:.1f}mm')
     print('=== 开始训练 20k 步 ===')
     model.learn(total_timesteps=60000)
+    model.save(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'models',
+                            'peg_hole_rl.zip'))
+    print('模型已保存: models/peg_hole_rl.zip')
     print('=== 训练后评估 ===')
     sr1, d1 = evaluate(model)
     print(f'success_rate={sr1*100:.1f}%  avg_insertion={d1*1000:.1f}mm')
