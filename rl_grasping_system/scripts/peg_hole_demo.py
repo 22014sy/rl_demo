@@ -26,6 +26,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--lateral', type=float, default=0.05, help='初始水平偏移(m)扰动展示')
     ap.add_argument('--max-frames', type=int, default=120)
+    ap.add_argument('--camera', type=str, default='side_view',
+                    help='相机名：side_view（侧面）/ eye_to_hand（俯视）')
+    ap.add_argument('--out', type=str, default=OUT, help='gif 输出路径')
     args = ap.parse_args()
 
     model = PPO.load(MODEL_PATH)
@@ -37,19 +40,20 @@ def main():
     frames = []
     success = False
     for i in range(args.max_frames):
-        renderer.update_scene(env.data)
+        renderer.update_scene(env.data, camera=args.camera)
         frames.append(Image.fromarray(renderer.render()))
         a, _ = model.predict(obs, deterministic=True)
         obs, _, term, trunc, info = env.step(a)
         if term or trunc:
             success = info['success']
             break
-    renderer.update_scene(env.data)   # 结束帧
+    renderer.update_scene(env.data, camera=args.camera)   # 结束帧
     frames.append(Image.fromarray(renderer.render()))
 
-    os.makedirs(os.path.dirname(OUT), exist_ok=True)
-    frames[0].save(OUT, save_all=True, append_images=frames[1:], duration=80, loop=0)
-    print(f'gif saved: {OUT} ({len(frames)} 帧, success={success}, 插入深度 {info["insertion"]*1000:.0f}mm)')
+    os.makedirs(os.path.dirname(args.out), exist_ok=True)
+    frames[0].save(args.out, save_all=True, append_images=frames[1:], duration=80, loop=0)
+    print(f'gif saved: {args.out} ({len(frames)} 帧, camera={args.camera}, '
+          f'success={success}, 插入深度 {info["insertion"]*1000:.0f}mm)')
 
 
 if __name__ == '__main__':
