@@ -39,6 +39,7 @@ SAFE_CONFIG = np.array([-1.5708, -1.5708, 1.5708, -1.5708, -1.5708, 0.0])
 HOLE_CENTER = np.array([0.1, 0.42, 0.32])       # 孔中心（孔面 z=0.32）
 PEG_TIP_OFFSET = 0.18                            # peg 尖端相对 rq_base_mount 局部 +z 偏移(m)
 SUCCESS_DEPTH = 0.012                            # 插入深度阈值(m) = peg_tip 低于孔面 ≥ 12mm
+ALIGN_TOL = 0.005                                # 尖端须在孔口内(|dx|,|dy| < 5mm)——排除"压在孔板表面"假成功
 MAX_EE_DELTA = 0.005                             # 每决策步位置增量上限(m)
 DT, SUBSTEPS, ACTION_REPEAT = 0.002, 10, 2       # 决策周期 T = 0.04s
 KP = np.array([200., 200., 200., 100., 100., 60.])
@@ -114,6 +115,19 @@ class PegHoleEnv(gym.Env):
         tip = self.data.site_xpos[self.tip_id]
         return HOLE_CENTER[2] - tip[2]
 
+    def _is_success(self):
+        """真实插入判定（2026-08-29 修复）：深度 ≥ 阈值 且 尖端在孔口内。
+
+        旧判定只看深度——peg 在孔外压在孔板表面（尖端穿透深度够）也误判成功
+        （实测 tip_xy_off 达 89mm）。加入 |dx|,|dy| < ALIGN_TOL 排除压板假象。
+        """
+        tip = self.data.site_xpos[self.tip_id]
+        if HOLE_CENTER[2] - tip[2] < SUCCESS_DEPTH:
+            return False
+        dx = abs(tip[0] - HOLE_CENTER[0])
+        dy = abs(tip[1] - HOLE_CENTER[1])
+        return dx < ALIGN_TOL and dy < ALIGN_TOL
+
     def step(self, action):
         a = np.clip(np.asarray(action, dtype=float).ravel()[:3], -MAX_EE_DELTA, MAX_EE_DELTA)
         v_ee = np.concatenate([a / self.T, np.zeros(3)])
@@ -139,15 +153,17 @@ class PegHoleEnv(gym.Env):
         insertion = self._insertion_depth()
         d_xy = float(np.linalg.norm(tip[:2] - HOLE_CENTER[:2]))
 
-        # 奖励：水平对准（势能）+ 垂直接近 + 插入深度（线性，一旦插入即正收益）+ 成功 + 步罚
-        r = -5.0 * min(d_xy / 0.3, 1.0)
+        # 奖励：水平对准（主势能 + 近距离锚定，引导精确对准 <1mm）+ 垂直接近 + 插入深度 + 成功 + 步罚
+        # 2026-08-29：正确判定下（需尖端在孔口内）对准是硬门槛——近距离锚定让 d_xy<1cm 时梯度陡，
+        # 参考抓取项目修复"悬停"的 _anchor_boost 方法。
+        r = -5.0 * min(d_xy / 0.3, 1.0) - 3.0 * min(d_xy / 0.01, 1.0)
         if insertion <= 0.0:
             r += -3.0 * min((HOLE_CENTER[2] - tip[2]) / 0.3, 1.0)
         else:
             r += 10.0 * min(insertion, 0.02) / 0.02
         r += -0.01
 
-        success = insertion >= SUCCESS_DEPTH
+        success = self._is_success()   # 2026-08-29：深度 + 尖端在孔口内（修复压板假成功）
         if success:
             r += 100.0
         terminated = success
@@ -157,7 +173,9 @@ class PegHoleEnv(gym.Env):
         return self._get_obs(), float(r), terminated, truncated, info
 
 def make_env():
-    return PegHoleEnv()
+    e = PegHoleEnv()
+    e.lateral_range = 0.005  # 2026-08-29 课程式：先学近端对准+下压（±5mm），再评估扰动泛化
+    return e
 
 
 def evaluate(model, n=30):
@@ -188,7 +206,7 @@ def main():
     sr0, d0 = evaluate(model)
     print(f'success_rate={sr0*100:.1f}%  avg_insertion={d0*1000:.1f}mm')
     print('=== 开始训练 20k 步 ===')
-    model.learn(total_timesteps=60000)
+    model.learn(total_timesteps=150000)
     model.save(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'models',
                             'peg_hole_rl.zip'))
     print('模型已保存: models/peg_hole_rl.zip')
