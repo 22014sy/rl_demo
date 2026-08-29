@@ -298,10 +298,10 @@
     <geom type="sphere" size="0.001" rgba="0 0 0 0" contype="0" conaffinity="0"/>
   </body>
   <camera name="eye_to_hand" mode="track" target="cam_target"
-          pos="0.100000 0.420000 1.200000" fovy="60"/>
+          pos="0.100000 0.95 0.55" fovy="50"/>
   <!-- 侧面视角（2026-08-28 demo）：从 y 负方向（臂侧面）平视孔板，看清 peg 下降插入过程 -->
   <camera name="side_view" mode="track" target="cam_target"
-          pos="0.100000 0.900000 0.500000" fovy="50"/>
+          pos="0.100000 0.95 0.55" fovy="50"/>
 
   <!-- ===== 障碍物已移除（peg-in-hole 最小尝试不涉及避障；原 obstacle 段见 ur5e_robotiq_cube.xml） ===== -->
 

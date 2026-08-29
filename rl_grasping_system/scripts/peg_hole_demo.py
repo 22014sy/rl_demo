@@ -36,19 +36,31 @@ def main():
     env.lateral_range = args.lateral
     renderer = mujoco.Renderer(env.model, height=480, width=640)
 
+    def render_frame():
+        if args.camera == 'side_view':
+            # 自由相机远景：看清机械臂全貌 + 桌面 + 孔板 + peg 插入（track 相机 EGL 下远距离失效）
+            renderer.update_scene(env.data)
+            cam = renderer.scene.camera[0]
+            cam.pos = np.array([0.1, 1.5, 0.7])
+            target = np.array([0.1, 0.42, 0.30])
+            fwd = target - cam.pos
+            cam.forward = fwd / np.linalg.norm(fwd)
+            cam.up = np.array([0.0, 0.0, 1.0])
+        else:
+            renderer.update_scene(env.data, camera=args.camera)
+        return Image.fromarray(renderer.render())
+
     obs, _ = env.reset(seed=7)
     frames = []
     success = False
     for i in range(args.max_frames):
-        renderer.update_scene(env.data, camera=args.camera)
-        frames.append(Image.fromarray(renderer.render()))
+        frames.append(render_frame())
         a, _ = model.predict(obs, deterministic=True)
         obs, _, term, trunc, info = env.step(a)
         if term or trunc:
             success = info['success']
             break
-    renderer.update_scene(env.data, camera=args.camera)   # 结束帧
-    frames.append(Image.fromarray(renderer.render()))
+    frames.append(render_frame())   # 结束帧
 
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     frames[0].save(args.out, save_all=True, append_images=frames[1:], duration=80, loop=0)
