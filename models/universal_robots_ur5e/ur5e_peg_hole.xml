@@ -301,7 +301,7 @@
           pos="0.100000 0.420000 1.200000" fovy="60"/>
   <!-- 侧面视角（2026-08-28 demo）：从 y 负方向（臂侧面）平视孔板，看清 peg 下降插入过程 -->
   <camera name="side_view" mode="track" target="cam_target"
-          pos="0.100000 -0.250000 0.420000" fovy="45"/>
+          pos="0.100000 0.900000 0.500000" fovy="50"/>
 
   <!-- ===== 障碍物已移除（peg-in-hole 最小尝试不涉及避障；原 obstacle 段见 ur5e_robotiq_cube.xml） ===== -->
 
