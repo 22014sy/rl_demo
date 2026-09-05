@@ -16,9 +16,19 @@ MuJoCo 侧没有 MoveIt，用本模块生成"朝当前目标上方 pre-grasp 点
   "残差幅度统计：静态小 / 动态大"这一架构分工成立证据的仿真侧前提；
 - 近端 gain·d 线性减速（阻尼引导收敛），远端 clamp 到 nominal_approach_speed，
   全程 ≤ v_max 契约 0.125 m/s（docs/sim_to_real动力学匹配方案.md）。
+
+2026-09-02 P2b 升级：可选 IK 可达性检查（nominal_ik_check=True，默认开）。
+对标真 MoveIt 语义——真 MoveIt「IK 解算目标位姿 → 轨迹采样 → Servo 下发 twist」：
+本替身对段目标（hover 位姿）用 solve_ik 从当前位形验证可达性：
+  - 可达 → 正常速度场（与纯几何两段速度场行为 bit 一致，零回归）；
+  - 不可达 → 返回零速度（保持），对标 MoveIt「规划失败 → 不动」，
+    并为将来扩大 workspace（边界点可能越出 IK 可达域）提供兜底。
 """
 
 import numpy as np
+import mujoco
+import time
+import ik as _ik
 
 
 class NominalTrajectory:
@@ -38,7 +48,64 @@ class NominalTrajectory:
         self.use_ik_traj = bool(getattr(cfg, "nominal_ik_two_stage", True))
         self.ik_clearance = float(getattr(cfg, "nominal_approach_clearance", 0.15))
         self.ik_switch_tol = float(getattr(cfg, "nominal_stage_switch_tol", 0.02))
+        # 2026-09-02 P2b：IK 可达性检查（对齐真 MoveIt「IK 解算目标位姿」语义，见模块 docstring）
+        self.use_ik_check = bool(getattr(cfg, "nominal_ik_check", True))
+        self.ik_check_tol = float(getattr(cfg, "nominal_ik_check_tol", 0.01))
+        self.ik_recheck = float(getattr(cfg, "nominal_ik_check_recheck", 0.005))
+        self._model = None              # bind() 后非 None → 启用 IK 检查
+        self._check_pos = None          # 上次检查的目标位置（缓存键）
+        self._reachable = True          # 缓存的可达性结论
+        self._last_warn = 0.0           # 不可达告警频率控制
         self.reset()
+
+    def bind(self, model, data, arm_joint_ids, body_id):
+        """绑定模型/数据引用（环境构造后调用）。未 bind 时 IK 检查自动跳过。"""
+        self._model = model
+        self._data = data
+        self._arm_joint_ids = list(arm_joint_ids)
+        self._body_id = int(body_id)
+        # 抓取姿态：手指朝下、局部 x = 世界 x（2F-85 开合轴），与 verify_grasp_success_criterion.py 一致
+        self._grasp_quat = _ik.frame_to_quat(np.array([0.0, 0.0, -1.0]),
+                                             np.array([0.0, -1.0, 0.0]))
+        # home keyframe 位形：防"当前位形落局部极小→假不可达"的二次确认起点
+        kid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, "home")
+        self._home_q = None
+        if kid >= 0:
+            self._home_q = np.array([model.key_qpos[kid][model.jnt_qposadr[j]]
+                                     for j in self._arm_joint_ids], dtype=float)
+        return self
+
+    def _solve_err_from(self, scratch_qpos, target_pos):
+        """从指定臂位形出发 DLS 解 hover 位姿，返回位置误差(m)；异常/不可达返回大数。"""
+        model = self._model
+        scratch = mujoco.MjData(model)
+        scratch.qpos[:] = self._data.qpos[:]
+        scratch.qpos[self._arm_joint_ids] = scratch_qpos
+        scratch.qvel[:] = 0.0
+        mujoco.mj_forward(model, scratch)
+        hover = (np.asarray(target_pos, dtype=float).ravel()[:3]
+                 + np.array([0.0, 0.0, self.hover_z_offset]))
+        try:
+            _, err = _ik.solve_ik(model, scratch, self._body_id, hover, self._grasp_quat,
+                                  self._arm_joint_ids, iters=300, tol=5e-3)
+        except Exception:
+            return 1.0
+        return float(err)
+
+    def _target_reachable(self, target_pos):
+        """hover 目标可达性检查（带缓存）。当前位形 + home 双起点防局部极小误判。"""
+        tg = np.asarray(target_pos, dtype=float).ravel()[:3]
+        if self._check_pos is not None and                 float(np.linalg.norm(tg - self._check_pos)) < self.ik_recheck:
+            return self._reachable
+        cur_q = self._data.qpos[self._arm_joint_ids].copy()
+        if self._solve_err_from(cur_q, tg) < self.ik_check_tol:
+            self._reachable = True
+        elif self._home_q is not None:
+            self._reachable = self._solve_err_from(self._home_q, tg) < self.ik_check_tol
+        else:
+            self._reachable = False
+        self._check_pos = tg
+        return self._reachable
 
     def reset(self):
         """重置（两段轨迹模式需清段状态）"""
@@ -62,6 +129,17 @@ class NominalTrajectory:
         ee = np.asarray(ee_pos, dtype=float).ravel()[:3]
         tg = np.asarray(target_pos, dtype=float).ravel()[:3]
         hover = tg + np.array([0.0, 0.0, self.hover_z_offset])
+
+        # 2026-09-02 P2b：IK 可达性检查——hover 目标不可达时保持（对标 MoveIt 规划失败→不动）。
+        # 当前 workspace（IK 打点 100% 可达）下恒通过，行为与纯几何两段速度场 bit 一致；
+        # 仅当 workspace 扩大/目标越出 IK 可达域时才生效，为 RL 残差保留行动空间而非朝不可达空转。
+        if self.use_ik_check and self._model is not None:
+            if not self._target_reachable(tg):
+                _now = time.time()
+                if _now - self._last_warn > 5.0:
+                    self._last_warn = _now
+                    print(f"[nominal] IK 不可达: target={tg.round(4)} hover={hover.round(4)} → 标称保持")
+                return np.zeros(6)
 
         # 两段轨迹模式（2026-08-27 P2a §8.3，复刻 MoveIt 无碰撞接近）：段1 先到 cube 正上方高处
         # （水平对齐、不扫过物体），段2 垂直下降到 hover。段目标随 target_pos 更新（动态目标天然跟踪）。

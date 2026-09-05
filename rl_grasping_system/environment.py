@@ -110,6 +110,10 @@ class GraspingEnv(gym.Env):
 
         # D1: 标称轨迹（residual 模式）——MoveIt 标称仿真替身（delta 模式为 None）
         self.nominal_trajectory = make_nominal_trajectory(grasping_config)
+        # P2b（2026-09-02）：标称 IK 可达性检查绑定（solve_ik 验证 hover 可达；不可达→标称保持）
+        if self.nominal_trajectory is not None:
+            self.nominal_trajectory.bind(self.model, self.data,
+                                         self.arm_joint_ids, self.end_effector_id)
         # D1: 当前标称参考速度（观测槽位；delta 模式恒 0，residual 模式每决策步刷新）
         self._v_nominal = np.zeros(6)
 

@@ -5,6 +5,35 @@
 
 ---
 
+## 2026-09-02 · 标称轨迹升级：IK 可达性检查（对齐 MoveIt「IK 解算目标位姿」语义）
+
+### 动机
+标称替身（`nominal_trajectory.py`）此前是**纯几何两段速度场**（P 控制，目标点直接由
+target_pos + hover_z_offset 构造），与真 MoveIt「IK 解算目标位姿 → 轨迹采样 → Servo 下发 twist」
+仅行为近似、无解算环节。本次加入 **solve_ik 可达性检查**：
+- 语义对齐：标称对 hover 目标先 IK 验证可达，与 MoveIt 规划语义同构；
+- 兜底能力：目标越出 IK 可达域时标称**保持不动**（对标 MoveIt 规划失败→不动），
+  为将来扩大 workspace（新边界点可能不可达）预铺基础设施。
+
+### 改动
+- **`nominal_trajectory.py`**：新增 `bind(model, data, arm_joint_ids, body_id)`（环境构造后调用）、
+  `_solve_err_from`（DLS 解 hover 位置误差，从当前位形出发）与 `_target_reachable`
+  （当前位形 + home keyframe 双起点防局部极小误判；带缓存，目标移动 < 5mm 复用结论）；
+  `reference_velocity` 中 hover 不可达 → 返回零速度并 5s 限频告警。
+- **`environment.py`**：构造标称后调用 `bind(...)`。
+- **`config.py`**：新增 `nominal_ik_check=True` / `nominal_ik_check_tol=0.01` /
+  `nominal_ik_check_recheck=0.005`。
+
+### 验证
+- py_compile 三文件通过；冒烟测试：可达目标正常驱动（0.12 m/s）→ 不可达目标（桌外远点）
+  零速度保持 → 缓存复用 → 回到可达恢复驱动 → 环境 step×10 不崩。
+- 当前 workspace（IK 打点 100% 可达）下恒通过检查，**行为与纯几何两段速度场 bit 一致，零回归**。
+
+### 影响
+- 成功率不变（90% 是速度环执行上限；97.5% 需关节伺服、与残差接口不兼容，见
+  `docs/2026-08-27_部署分工与最小验证.md §8.1`）。
+- 后续若扩大 workspace_bounds，本检查自动生效（不可达目标不空转，RL 残差保留行动空间）。
+
 ## 2026-08-28 · peg-in-hole 最小尝试（接触操作信号可行性）
 
 ### 动机

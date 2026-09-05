@@ -182,6 +182,12 @@ class GraspingConfig:
     nominal_ik_two_stage: bool = True       # 标称两段轨迹模式（2026-08-27 P2a：90%）。复刻 MoveIt 无碰撞轨迹：
                                             # 段1 末端先到 cube 正上方高处（水平对齐、不扫过物体），段2 垂直下降到 hover。
                                             # 单段速度场直插会扫过 cube 撞飞物体（60%→90%），见 §8.3。速度环执行 + RL 残差兼容。
+    # P2b（2026-09-02）：标称 IK 可达性检查（对齐真 MoveIt「IK 解算目标位姿」语义）。
+    #   solve_ik 从当前位形验证 hover 位姿可达：可达→正常速度场（行为零回归）；不可达→标称保持
+    #   （对标 MoveIt「规划失败→不动」，为扩大 workspace/越出 IK 可达域提供兜底），见 nominal_trajectory.py docstring。
+    nominal_ik_check: bool = True           # 是否启用标称目标 IK 可达性检查（默认开；当前 workspace 100% 可达恒通过）
+    nominal_ik_check_tol: float = 0.01      # 可达判定容差 (m)：solve_ik 位置误差 < 该值视为可达
+    nominal_ik_check_recheck: float = 0.005 # 目标位置变化超过该值(m)才重新解 IK（动态目标节流；0.05m/s×0.04s≈2mm/步）
     nominal_approach_clearance: float = 0.15   # 段1 悬停高度 = hover + 该值（m），保证不碰 cube（cube 高 4cm）
     nominal_stage_switch_tol: float = 0.02     # 段1→段2 切换阈值（末端距段1目标 < 该值 m）
     nominal_feedforward_gain: float = 1.0   # 动态目标速度前馈增益（2026-08-27）：v_nominal += k·v_target。
