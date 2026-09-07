@@ -106,9 +106,22 @@ python3 train_with_monitor.py --action-mode residual --nominal-mode mpc \
 4. **统计诚实性**：n=30 单次评估，每个场景成功率的 95%CI ≈ ±8~17pp；dyn_target 73.3% 与 83.3%、dyn_both 86.7% 与 90.0% 的差异均在 CI 内；§3.2 纯 MPC 复测与 Stage1 记录（66.7%/80.0%）的差异同属此幅度，判定以「达标/未达标」而非具体百分点为准。
 
 ### 4.4 后续方向（若继续 Stage 2+）
-- 残差稀疏化：降低 `--residual-reg` / 加 L1 正则，或对残差动作乘门控，逼策略只在必要时出手，避免常态饱和扰动 MPC。
-- 极端场景 curriculum：训练 mix 中加入 static3/mixed3/mixed_z 难度，让残差学会「绕行穿越」而非仅直线修正。
-- 状态自适应上限：把残差 clip 上界与 MPC 可行域解耦（MPC 无解/低裕度时允许残差加大），dyn_target 与 static3 或可上探。
+
+> **2026-09-08 更新**：§4.3 的残差饱和缺陷已完成归因与修复方案，见
+> **`docs/2026-09-08_残差饱和分析与奖励重塑方案.md`**（证据链、根因 A–D、经济学账、v25 三路修复
+> 与 Go/No-Go 判定线）。v25_mpcres_sparse（2026-09-07 23:01 发起）已实施以下三项：
+> 1. **残差预算与 MPC 解耦**：residual 分支 clip 0.005→0.002（v_max_res 0.125→0.05 m/s，MPC 的 40%）；
+> 2. **L1 稀疏三件套**：`r_residual` = L2(2.0) + L1(2.0) + 激活步罚(1.0, τ=0.02)，满幅残差成本从 18.7 → ≈60/集，与成功 +130 同级；
+> 3. **高密度课程**：`--scenario-mix` 扩展 5 场景（+static3/mixed3，共 ~25% 权重），残差不再零样本硬扛。
+>
+> **判定线补充（v25 必须同时满足）**：`avg_residual_norm` 呈双峰（常态≈0、尖峰≤0.0866）且均值 <0.05——
+> 否则即使成功率达标也算未达标（防「恒偏置硬闯」模型再次蒙混过关）。
+> Go/No-Go：混合场景 coll 回落 ≤15% 且至少一个 MPC 硬伤场景（static3>0% 或 mixed_z coll<13.3%）出现残差增益 → Go 继续 Stage 3；
+> 否则 No-Go，把 v24 定档为架构对照终点，主方向转向纯 MPC 工程化。
+
+- ~~残差稀疏化：降低 `--residual-reg` / 加 L1 正则，或对残差动作乘门控……~~（已由 v25 L1 三件套实施）
+- ~~极端场景 curriculum：训练 mix 中加入 static3/mixed3/mixed_z 难度……~~（已由 v25 5 场景 mix 实施）
+- 状态自适应上限：把残差 clip 上界与 MPC 可行域解耦（MPC 无解/低裕度时允许残差加大），dyn_target 与 static3 或可上探。（v25 仅做单向解耦——固定降幅；双向「MPC 无解时放大残差」留待 Stage 3）
 
 ## 5. 产物与复现
 - 模型：`models/final_model_stage2_d2_v24_mpcres.zip` + `_vecnormalize.pkl`（git 跟踪；zip 10.3MB / pkl 6.7KB）
