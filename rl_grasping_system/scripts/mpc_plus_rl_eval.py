@@ -146,6 +146,9 @@ def main():
                     help="动作恒 0 → v_servo=v_nominal（纯标称对照）")
     ap.add_argument("--target-vel", type=float, default=0.05)
     ap.add_argument("--max-steps", type=int, default=200)
+    ap.add_argument("--residual-delta-cap", type=float, default=None,
+                    help="v25 残差预算解耦：residual 分支位置增量上限 m（默认 config.residual_delta_cap=0.002；"
+                         "重跑 v24 同口径对照传 0.005 恢复旧 clip）")
     ap.add_argument("--save-results", type=str, default="")
     args = ap.parse_args()
     sc = SCENE_CFG[args.scene]
@@ -160,6 +163,8 @@ def main():
     g.action_space_dim = 3
     g.use_fixed_position = True         # 固定物体位置（对齐消融口径）
     g.max_steps = args.max_steps
+    if args.residual_delta_cap is not None:
+        g.residual_delta_cap = args.residual_delta_cap   # v25：残差预算覆盖（默认 config 0.002）
 
     # ---- 目标/障碍场景（与 mpc_nominal_verify.py 同口径） ----
     g.dynamic_target_enabled = sc["dyn_target"]

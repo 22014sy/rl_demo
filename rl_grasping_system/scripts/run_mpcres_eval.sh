@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Stage 2 批量评估：v24_mpcres（MPC + PPO Δv）六场景，n=30，确定性。
+# Stage 2 批量评估：MPC + PPO Δv 六场景，n=30，确定性。
 # 回填 4 象限第 4 格（MPC × PPO Δv）；结果落 results/mpc_plus_rl/*.json（gitignored，数字记 docs）。
 #
-# 用法：bash scripts/run_mpcres_eval.sh [--smoke N]
+# 用法：bash scripts/run_mpcres_eval.sh [--model MODELS/xxx.zip] [--smoke N | --serial]
+#   默认模型 v24_mpcres；v25 传 --model models/final_model_stage2_d2_v25_mpcres_sparse.zip
 #   --smoke N  每场景只跑 N 集（冒烟，默认全量 30）
 set -e
 cd "$(dirname "$0")/.."
@@ -10,10 +11,15 @@ cd "$(dirname "$0")/.."
 MODEL=models/final_model_stage2_d2_v24_mpcres.zip
 N=30
 PARALLEL=1
-case "$1" in
-  --smoke) N=${2:-3}; PARALLEL=0 ;;
-  --serial) PARALLEL=0 ;;
-esac
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --smoke) N=${2:-3}; PARALLEL=0; shift 2 ;;
+    --serial) PARALLEL=0; shift ;;
+    --model) MODEL=$2; shift 2 ;;
+    *) shift ;;
+  esac
+done
+echo "==== [mpcres-eval] MODEL=$MODEL n=$N ===="
 
 mkdir -p results/mpc_plus_rl
 rm -f results/mpc_plus_rl/static.json results/mpc_plus_rl/dyn_target.json \
