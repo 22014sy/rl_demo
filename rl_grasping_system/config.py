@@ -193,6 +193,22 @@ class GraspingConfig:
     nominal_feedforward_gain: float = 1.0   # 动态目标速度前馈增益（2026-08-27）：v_nominal += k·v_target。
                                             # 消纯 P 控制对移动目标的稳态跟踪滞后（err≈v_target/gain，
                                             # 见 docs/2026-08-27_部署分工与最小验证.md §4.1）
+    # --- P2c（2026-09-07）MPC 标称层：nominal_mode ---
+    # 'velocity_field' = 现有速度场标称（假 MoveIt，无状态 O(1)，训练快）
+    # 'mpc'            = 末端级滚动最优控制（scipy SLSQP，见 mpc_nominal.py）。
+    #                    v = v_mpc(t) + Δv（MPC 标称 + RL 残差）：MPC 处理确定性可预测障碍
+    #                    （含 z 方向运动），RL 残差只补 MPC 模型误差/随机游走预测失效。
+    #                    与 velocity_field 共用同一 reference_velocity 接口/观测槽位（零改动）。
+    nominal_mode: str = "velocity_field"
+    # MPC 标称超参（nominal_mode='mpc' 时生效；与 scripts/mpc_ur5_grasp.py 基线同口径）
+    mpc_nominal_horizon: int = 10           # 预测步数（0.4s 时域 @ dt=0.04）
+    mpc_nominal_w_p: float = 40.0           # 到达 hover 权重
+    mpc_nominal_w_o: float = 1500.0         # 障碍分离软约束权重（MPC 自带避障，D_SAFE 外无惩罚）
+    mpc_nominal_d_safe: float = 0.20        # 避障安全距离 (m)（球 r=0.05 + margin）
+    mpc_nominal_w_s: float = 0.5            # 控制平滑权重（对齐 mpc_ur5_grasp.py 基线 W_S=0.5）
+    mpc_nominal_w_term: float = 800.0       # 终端硬权重（强制末步到位，破 warm-start 粘滞）
+    mpc_nominal_xy_align_tol: float = 0.035 # XY 对准阈值：对准后才允许降 z（防 pad 侧撞推走 cube）
+    mpc_nominal_approach_z: float = 0.06    # 未对准时目标悬高 (m)：先水平对准再下降（对标称两阶段语义）
 
     # --- D1 动态目标（L2 激活；L1 静止占位）---
     # 物体位置可 per-step 更新（运动学 qpos 写入，z 固定桌面高度 object_rest_z）
@@ -262,6 +278,23 @@ class GraspingConfig:
     # 真机/评估（D6）需要"碰撞=失败"时再启用。
     obstacle_collision_penalty: float = 0.0   # 撞上当步额外惩罚（<0 生效，叠加在接近惩罚之上）
     obstacle_collision_max_streak: int = 0    # 连续碰撞步数阈值 -> truncated（0=禁用；如 20 ≈0.8s 持续撞障）
+
+    # --- P2c（2026-09-07）per-obstacle 规格：更多障碍（静态+动态混合、z 方向运动）---
+    # None = 旧统一逻辑（obstacle_count / obstacle_vel / obstacle_motion_mode 应用于前 N 个障碍）。
+    # 设置后：每个激活障碍独立配置（XML 提供 obstacle/obstacle_2/...，按下标 i 匹配）：
+    #   {'type': 'static',  'pos': (x,y,z)}                       静态钉住锚点
+    #   {'type': 'dynamic', 'vel': 0.05, 'mode': 'random'|'roundtrip',
+    #    'axis': 'x'|'y', 'pos': (x,y,z),                         运动锚点/初始位置
+    #    'z_motion': True, 'z_amp': 0.10, 'z_period': 3.0}        z 方向往返运动（半幅 m / 周期 s）
+    # 动态障碍在 XY（random/roundtrip）基础上可选叠加 z 方向三角波往返（默认关闭）。
+    # 观测仍只给\"最近激活障碍\" rel/vel 槽位（67 维不变）；MPC 标称（nominal_mode='mpc'）用全部
+    # 激活障碍做避障软约束预测。obstacle_on_nominal_path=True 时位置由\"必经之路\"布局覆盖，
+    # 运动行为（static/dynamic/z_motion）仍按 specs 生效。
+    obstacle_specs: List[dict] = None
+    # 旧统一逻辑下动态障碍的 z 方向往返运动开关与参数（obstacle_specs=None 时生效）：
+    obstacle_z_motion: bool = False          # 动态障碍是否叠加 z 方向三角波往返
+    obstacle_z_amp: float = 0.10             # z 往返半幅 (m)（锚点 ±z_amp；自动约束 ≥ 桌面顶+半径+0.02）
+    obstacle_z_period: float = 3.0           # z 往返周期 (s)
 
 
 

@@ -316,6 +316,30 @@
     <freejoint/>
   </body>
 
+  <!-- ===== P2c 更多障碍（2026-09-07）：obstacle_4 / obstacle_5 / obstacle_6 =====
+       与 obstacle 同构（sphere r=0.05 + freejoint + contype=1），per-obstacle 规格 obstacle_specs
+       可静态/动态混合（type/vel/mode/axis/z_motion），按 specs 数量激活前 N 个；
+       未激活置远处 + contype=0 不参与碰撞。观测仍只给"最近激活障碍"槽位（67 维不变），
+       MPC 标称（nominal_mode='mpc'）用全部激活障碍做避障软约束。 -->
+  <body name="obstacle_4" pos="1.000000 1.000000 1.000000">
+    <geom type="sphere" size="0.05" rgba="0.1 0.9 0.9 1"
+      contype="1" conaffinity="1" friction="0.5 0.3 0.01" mass="0.5"
+      solimp="0.99 0.995 0.001" solref="0.01 1"/>
+    <freejoint/>
+  </body>
+  <body name="obstacle_5" pos="1.000000 1.000000 1.000000">
+    <geom type="sphere" size="0.05" rgba="0.9 0.1 0.1 1"
+      contype="1" conaffinity="1" friction="0.5 0.3 0.01" mass="0.5"
+      solimp="0.99 0.995 0.001" solref="0.01 1"/>
+    <freejoint/>
+  </body>
+  <body name="obstacle_6" pos="1.000000 1.000000 1.000000">
+    <geom type="sphere" size="0.05" rgba="0.9 0.1 0.9 1"
+      contype="1" conaffinity="1" friction="0.5 0.3 0.01" mass="0.5"
+      solimp="0.99 0.995 0.001" solref="0.01 1"/>
+    <freejoint/>
+  </body>
+
   </worldbody>
 
   <!-- ===== 臂关节速度控制 =====

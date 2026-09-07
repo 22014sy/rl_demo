@@ -176,8 +176,18 @@ class NominalTrajectory:
         return np.concatenate([v, np.zeros(3)]).astype(np.float64)
 
 
-def make_nominal_trajectory(cfg) -> NominalTrajectory:
-    """工厂：residual 模式返回标称轨迹实例，否则返回 None。"""
-    if str(getattr(cfg, "action_mode", "delta")).lower() == "residual":
-        return NominalTrajectory(cfg)
-    return None
+def make_nominal_trajectory(cfg):
+    """工厂：residual 模式返回标称轨迹实例（速度场或 MPC），否则返回 None。
+
+    P2c（2026-09-07）：按 cfg.nominal_mode 分发——
+      'velocity_field' → 本文件速度场替身（假 MoveIt，无状态 O(1)，训练快）
+      'mpc'            → mpc_nominal.MpcNominal（末端级滚动最优控制，自带障碍避障软约束）
+    两者接口一致（reference_velocity → 6 维 twist），观测槽位/环境 step 零改动。
+    """
+    if str(getattr(cfg, "action_mode", "delta")).lower() != "residual":
+        return None
+    mode = str(getattr(cfg, "nominal_mode", "velocity_field")).lower()
+    if mode == "mpc":
+        from mpc_nominal import MpcNominal
+        return MpcNominal(cfg)
+    return NominalTrajectory(cfg)

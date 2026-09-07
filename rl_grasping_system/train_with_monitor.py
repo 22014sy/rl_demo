@@ -59,6 +59,10 @@ def main():
     # D1（2026-08-24，一周冲刺方案 §5）：残差策略 + 动态化环境地基
     parser.add_argument('--action-mode', type=str, default='', choices=['', 'delta', 'residual'],
                         help='D1 动作模式：delta=旧增量语义（默认）；residual=标称轨迹+残差叠加 v=v_nominal+Δv/T')
+    # P2c（2026-09-07）：MPC 标称层（Stage 2：在 MPC 标称之上训练 RL 残差）
+    parser.add_argument('--nominal-mode', type=str, default='', choices=['', 'velocity_field', 'mpc'],
+                        help='P2c 标称层类型（residual 模式生效）：velocity_field=速度场替身（默认，O(1) 快）；'
+                             'mpc=末端级滚动最优控制（scipy SLSQP，自带障碍避障软约束，见 mpc_nominal.py）')
     parser.add_argument('--dynamic-target', action='store_true',
                         help='D1 动态目标（L2）：物体 per-step 沿 target_motion_axis 往返运动')
     parser.add_argument('--target-vel', type=float, default=0.0,
@@ -141,6 +145,10 @@ def main():
         # D1（2026-08-24，一周冲刺方案 §5）：残差策略 + 动态化环境地基
         if args.action_mode:
             config.grasping.action_mode = args.action_mode
+        if args.nominal_mode:
+            config.grasping.nominal_mode = args.nominal_mode
+            logger.info(f"🎛️ P2c 标称层：nominal_mode={config.grasping.nominal_mode}"
+                        f"（mpc=末端级滚动最优控制，velocity_field=速度场替身）")
         if args.dynamic_target:
             config.grasping.dynamic_target_enabled = True
             if args.target_vel > 0:
