@@ -122,6 +122,10 @@ data/
 *.csv
 *.json
 *.pkl
+# v24_mpcres VecNormalize 统计是模型部署必需（zip 同目录），放行入库
+!rl_grasping_system/models/final_model_stage2_d2_v24_mpcres_vecnormalize.pkl
+# 训练脚本 CWD 在 models/ 下导致的重复输出目录（checkpoint 副本），不入库
+rl_grasping_system/models/models/
 *.h5
 *.ckpt
 *.pth
