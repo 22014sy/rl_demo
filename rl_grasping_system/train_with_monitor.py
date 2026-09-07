@@ -91,6 +91,22 @@ def main():
                              '>1 时沿必经之路不同 fraction/lateral 排布，观测仍只给最近激活障碍槽位（67 维不变）')
     parser.add_argument('--residual-reg', type=float, default=-1.0,
                         help='D2 残差幅度正则权重（≥0 覆盖 config.reward.residual_reg_w；<0 用默认 0.5）')
+    # v25 残差稀疏三件套 + 残差预算解耦（2026-09-08，见 docs/2026-09-08_残差饱和分析与奖励重塑方案.md）
+    parser.add_argument('--residual-l1-w', type=float, default=-1.0,
+                        help='v25 L1 稀疏权重（≥0 覆盖 config.reward.residual_l1_w；-r_residual += -w·‖Δv‖₁，'
+                             '满幅残差成本与成功奖励同级，逼常态零残差；<0 用默认 0）')
+    parser.add_argument('--residual-step-w', type=float, default=-1.0,
+                        help='v25 残差激活步罚（≥0 覆盖 config.reward.residual_step_w；‖Δv‖>τ 当步再罚；<0 用默认 0）')
+    parser.add_argument('--residual-step-threshold', type=float, default=None,
+                        help='v25 残差激活判定阈值 m/s（覆盖 config.reward.residual_step_threshold；默认 0.02）')
+    parser.add_argument('--residual-delta-cap', type=float, default=None,
+                        help='v25 残差预算解耦：residual 分支每决策步位置增量上限 m（覆盖 config.grasping.residual_delta_cap；'
+                             '0.002→v_max_res=0.05 m/s = MPC v_max 40%；None 用默认 0.002）')
+    parser.add_argument('--residual-collision-threshold', type=float, default=None,
+                        help='v25 残差碰撞双倍罚判定阈值 m/s（覆盖 config.reward.residual_collision_threshold；默认 0.02）')
+    parser.add_argument('--residual-collision-penalty-extra', type=float, default=None,
+                        help='v25 残差引起的碰撞双倍罚：collision 且 ‖Δv‖>τ 时在 collision-penalty 之外再叠加该罚'
+                             '（≤0 有效，如 -10；None 用默认 0 关闭）')
     parser.add_argument('--obstacle-w', type=float, default=-1.0,
                         help='D2 障碍接近惩罚权重（≥0 覆盖 config.reward.obstacle_w；<0 用默认 0.5）')
     parser.add_argument('--obstacle-clear-bonus', type=float, default=-1.0,
@@ -182,6 +198,19 @@ def main():
             config.grasping.obstacle_path_z_offset = args.obstacle_path_z_offset
         if args.residual_reg >= 0:
             config.reward.residual_reg_w = args.residual_reg
+        # v25 残差稀疏三件套 + 残差预算解耦（覆盖逻辑）
+        if args.residual_l1_w >= 0:
+            config.reward.residual_l1_w = args.residual_l1_w
+        if args.residual_step_w >= 0:
+            config.reward.residual_step_w = args.residual_step_w
+        if args.residual_step_threshold is not None:
+            config.reward.residual_step_threshold = args.residual_step_threshold
+        if args.residual_delta_cap is not None:
+            config.grasping.residual_delta_cap = args.residual_delta_cap
+        if args.residual_collision_threshold is not None:
+            config.reward.residual_collision_threshold = args.residual_collision_threshold
+        if args.residual_collision_penalty_extra is not None:
+            config.reward.residual_collision_penalty_extra = args.residual_collision_penalty_extra
         if args.obstacle_w >= 0:
             config.reward.obstacle_w = args.obstacle_w
         if args.obstacle_clear_bonus >= 0:
@@ -192,8 +221,10 @@ def main():
             config.grasping.obstacle_mix_ratio = args.obstacle_mix_ratio
         if args.scenario_mix:
             _v = tuple(float(x) for x in args.scenario_mix.split(','))
-            if len(_v) != 3:
-                raise SystemExit('--scenario-mix 需要 3 个概率 "静态,动态,动态+障碍"（如 0.4,0.3,0.3）')
+            # v25（2026-09-08）：支持 5 场景 mix（静态无障/动态目标/动态+障碍/static3/mixed3）；旧 3 值保持兼容
+            if len(_v) not in (3, 5):
+                raise SystemExit('--scenario-mix 需要 3 或 5 个概率 "静态,动态,动态+障碍[,静态3障碍,混合3障碍]"'
+                                 '（如 0.4,0.3,0.3 或 0.25,0.2,0.35,0.1,0.1）')
             config.grasping.scenario_mix = _v
             config.grasping.dynamic_target_enabled = True   # 提供 target_vel_xy 语义；per-episode 采样决定实际激活
             config.grasping.obstacle_enabled = True

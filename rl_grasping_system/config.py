@@ -44,6 +44,11 @@ class GraspingConfig:
     # 增量经 DLS IK（ik.solve_ik）反解为目标关节位形，再写 ctrl = 位置伺服目标。
     action_space_dim: int = 3  # 并行改造(2026-08-22): 6→3（仅位置，姿态固定朝下）。实证(2026-08-22 diag_orientation_reward) w_orient=0.0 时 6D 的姿态维度无学习信号，纯熵探索浪费样本；先降维打通"到达→对齐→闭合"链路
     max_ee_delta: float = 0.005   # 每决策步位置增量上限 (m)；v_max=Δp/T=0.125m/s（速度环可靠区，训练/部署两端一致；见 docs/sim_to_real动力学匹配方案.md）
+    # v25 残差预算与 MPC 可行域解耦（2026-09-08，见 docs/2026-09-08_残差饱和分析与奖励重塑方案.md）：
+    #   residual 模式下残差分支每决策步位置增量上限 m——v_max_res=cap/T=0.05m/s = MPC v_max 的 40%。
+    #   残差只能是"微调"（0.5s 内 ~2.5cm 修正量），不能"覆盖"MPC 刚算出的安全速度方向；
+    #   delta 模式不受影响（仍用 max_ee_delta）。v24 恒 0.2165 的饱和根因即 clip 上界与此处同级。
+    residual_delta_cap: float = 0.002
     max_orient_delta: float = 0.05  # 每步姿态增量上限 (rad，旋转向量模长上限；角速度 1.25rad/s)
     ik_error_hold: float = 0.02     # IK 位置误差超过该值(m)时保持当前位置（不朝不可达目标乱动）
     # Task3: 速度级 IK 阻尼系数（雅可比阻尼伪逆 dq=(JᵀJ+λ²I)⁻¹Jᵀv；越大越稳但末端速度实现率越低）
@@ -430,6 +435,17 @@ class RewardConfig:
     #   默认 0 保持旧行为（旧模型/旧训练不引入额外奖励，避免观测口径漂移）。
     obstacle_clear_bonus: float = 0.0
     residual_reg_w: float = 0.5    # 残差幅度正则权重（||Δv||=0.125 上限时约 -0.0078/步，温和不淹没抓取信号）
+    # v25 残差稀疏化（2026-09-08，见 docs/2026-09-08_残差饱和分析与奖励重塑方案.md）——经济学修复：
+    #   根因：v24 用 L2(reg_w=2.0) 对满偏置残差惩罚仅 ~0.094/步（200 步 ≈18.7）≪ 成功 +130，
+    #   满幅残差"几乎免费"→ PPO 停在 clip 上界（avg_residual_norm 恒 0.2165）。三件套治本：
+    #   r_residual = -residual_reg_w·||Δv||² - residual_l1_w·||Δv||₁ - residual_step_w·𝟙[||Δv||>τ]
+    residual_l1_w: float = 0.0    # L1 稀疏权重（满幅残差 ‖Δv‖₁=0.15@cap=0.002 → -0.15·w/步；w=2 时 200 步 ≈-60，与成功 +130 同级）
+    residual_step_w: float = 0.0  # 残差激活硬门控步罚：||Δv|| > τ 时当步再罚 -residual_step_w（进一步惩罚"持续激活"）
+    residual_step_threshold: float = 0.02  # 残差"激活"判定阈值 (m/s)：‖Δv‖ > 该值视为出手（≈30% 残差预算）
+    # v25 §4.5 残差引起的碰撞双倍惩罚：collision 且 ‖Δv‖ > τ 时，在 obstacle_collision_penalty 之外再叠加该罚，
+    # 让策略学到"不确定时别碰 MPC 标称"（直接对应 dyn_target 残差轻微干扰问题）。
+    residual_collision_threshold: float = 0.02     # 残差碰撞双倍罚判定阈值 (m/s)
+    residual_collision_penalty_extra: float = 0.0  # 残差激活下碰撞的额外惩罚（默认 0 关闭；训练 CLI --residual-collision-penalty-extra 覆盖）
 
 @dataclass
 class SystemConfig:

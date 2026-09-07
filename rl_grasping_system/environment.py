@@ -446,11 +446,18 @@ class GraspingEnv(gym.Env):
         
         # P3（2026-08-27）per-episode 场景采样：40% 静态无障 + 30% 动态目标 + 30% 动态目标+动态障碍。
         # 选中场景强制覆盖全局开关（配合 CLI --dynamic-target/--obstacle 提供 target_vel_xy/obstacle_vel）。
+        # v25（2026-09-08）扩展为 5 场景：静态无障, 动态目标无障, 动态+1障碍, static3(3静态障碍), mixed3(3混合障碍)。
+        #   后两者补训练分布缺失的高密度障碍（根因 C：v24 mix 无极端密度 → 残差 mixed3/mixed_z 零样本硬扛）；
+        #   旧 3 值调用保持兼容（第 4/5 位缺省=0）。
         # None（默认）= 旧机制：动态目标全跟随全局开关；障碍按 obstacle_mix_ratio 隐藏（check 兼容）。
+        self._scenario_obstacle_count = None   # per-episode 障碍数量 override（None=config.obstacle_count）
+        self._scenario_obstacle_vel = None     # per-episode 障碍速度 override（None=config.obstacle_vel）
         _sm = getattr(self.grasping_config, 'scenario_mix', None)
         if _sm is not None:
             _s, _d, _do = (max(0.0, float(x)) for x in _sm[:3])
-            _tot = _s + _d + _do
+            _s3 = max(0.0, float(_sm[3])) if len(_sm) > 3 else 0.0
+            _m3 = max(0.0, float(_sm[4])) if len(_sm) > 4 else 0.0
+            _tot = _s + _d + _do + _s3 + _m3
             if _tot <= 0.0:
                 _tot = 1.0
             _r = float(self.np_random.uniform()) * _tot
@@ -460,9 +467,22 @@ class GraspingEnv(gym.Env):
             elif _r < _s + _d:
                 self._dyn_active = True
                 self._obstacle_active = False
-            else:
+            elif _r < _s + _d + _do:
                 self._dyn_active = True
                 self._obstacle_active = True
+            elif _r < _s + _d + _do + _s3:
+                # static3 变体：3 静态 on-path 障碍墙（动态目标关；密度与评估 static3 同口径）
+                self._dyn_active = False
+                self._obstacle_active = True
+                self._scenario_obstacle_count = 3
+                self._scenario_obstacle_vel = 0.0
+            else:
+                # mixed3 变体：3 动态 on-path 障碍墙（动态目标关；比评估 mixed3 更密的动态墙，
+                # 逼残差学"高密度下收手/绕行"而非直线修正）
+                self._dyn_active = False
+                self._obstacle_active = True
+                self._scenario_obstacle_count = 3
+                self._scenario_obstacle_vel = 0.05
         else:
             # D3 §11.4 无障碍混合采样：每 episode 以 obstacle_mix_ratio 概率隐藏障碍做"纯抓取训练"
             # （防残差策略覆盖 v5 已学抓取技能——对比 v5 失败 r_obstacle=-66.8 的实证）；否则正常激活。
@@ -544,8 +564,12 @@ class GraspingEnv(gym.Env):
             dim = int(getattr(self.grasping_config, 'action_space_dim', 6))
             if a.size < dim:
                 a = np.concatenate([a, np.zeros(dim - a.size)])
-            pos_delta = np.clip(a[:3], -self.grasping_config.max_ee_delta,
-                                self.grasping_config.max_ee_delta)
+            # v25 残差预算与 MPC 解耦（2026-09-08）：residual 分支用独立 cap（config.residual_delta_cap，
+            # 0.002→v_max_res=0.05m/s = MPC v_max 的 40%），残差只能是"微调"不能"覆盖" MPC 标称；
+            # delta 模式保持旧语义（max_ee_delta=0.125）。v24 恒 0.2165 饱和的 clip 上界即来自此。
+            _pos_cap = (float(getattr(self.grasping_config, 'residual_delta_cap', 0.002))
+                        if self.action_mode == 'residual' else self.grasping_config.max_ee_delta)
+            pos_delta = np.clip(a[:3], -_pos_cap, _pos_cap)
             ori_delta = (np.clip(a[3:6], -self.grasping_config.max_orient_delta,
                                  self.grasping_config.max_orient_delta)
                          if dim >= 6 else np.zeros(3))
@@ -752,6 +776,7 @@ class GraspingEnv(gym.Env):
             # D2: 障碍接近距离 + 残差幅度（奖励惩罚输入；未启用时 inf/0 → r_obstacle/r_residual 恒 0）
             'obstacle_dist': self._get_obstacle_distance(),
             'residual_norm': float(np.linalg.norm(_res_delta)) if self.action_mode == 'residual' else 0.0,
+            'residual_l1': float(np.sum(np.abs(_res_delta))) if self.action_mode == 'residual' else 0.0,  # v25 L1 稀疏输入
             # v16 奖励经济学：累计碰撞计数（供 reward_breakdown 发"干净成功"bonus；reset 清零）
             'obstacle_collision_count': int(self.task_state.get('obstacle_collision_count', 0)),
         }
@@ -768,10 +793,16 @@ class GraspingEnv(gym.Env):
             self._obstacle_collision_streak += 1
             self.task_state['obstacle_collision_count'] += 1
             # 碰撞当步额外惩罚（默认 0 关闭；D6/真机需要"碰撞=失败"时配置 <0）
-            self.task_state['_collision_penalty_step'] = float(
-                getattr(self.grasping_config, 'obstacle_collision_penalty', 0.0))
-            if self.task_state['_collision_penalty_step'] < 0.0:
-                reward += self.task_state['_collision_penalty_step']
+            _coll_pen = float(getattr(self.grasping_config, 'obstacle_collision_penalty', 0.0))
+            # v25 §4.5 残差引起的碰撞双倍罚（2026-09-08）：残差激活（‖Δv‖>τ）下碰撞再叠加额外罚——
+            # 让策略学到"不确定时别碰 MPC 标称"（直接对应 dyn_target 残差轻微干扰问题）
+            if self.action_mode == 'residual' and float(np.linalg.norm(_res_delta)) > float(
+                    getattr(self.grasping_config, 'residual_collision_threshold', 0.02)):
+                _coll_pen += float(getattr(self.grasping_config,
+                                           'residual_collision_penalty_extra', 0.0))
+            self.task_state['_collision_penalty_step'] = _coll_pen
+            if _coll_pen < 0.0:
+                reward += _coll_pen
         else:
             self._obstacle_collision_streak = 0
         self.task_state['episode_reward'] += reward
@@ -885,7 +916,10 @@ class GraspingEnv(gym.Env):
         if specs:
             n_active = min(len(specs), len(self.obstacle_body_ids))
         else:
-            n_active = max(1, int(getattr(self.grasping_config, 'obstacle_count', 1)))
+            # v25：per-episode 场景 override（static3/mixed3 变体）优先于 config.obstacle_count
+            _cnt = getattr(self, '_scenario_obstacle_count', None)
+            n_active = max(1, int(_cnt if _cnt is not None
+                                  else getattr(self.grasping_config, 'obstacle_count', 1)))
         self._active_obstacle_body_ids = []
         anchors = {}
         for i, _bid in enumerate(self.obstacle_body_ids):
@@ -1037,7 +1071,10 @@ class GraspingEnv(gym.Env):
                 mode = str(spec.get('mode', 'random')).lower()
                 axis = 0 if str(spec.get('axis', 'y')).lower() == 'x' else 1
             else:
-                v = float(getattr(self.grasping_config, 'obstacle_vel', 0.0))
+                # v25：per-episode 场景 override（static3 变体=0 / mixed3 变体=0.05）优先于 config.obstacle_vel
+                _ovel = getattr(self, '_scenario_obstacle_vel', None)
+                v = float(_ovel if _ovel is not None
+                          else getattr(self.grasping_config, 'obstacle_vel', 0.0))
                 is_dynamic = v > 0.0
                 mode = str(getattr(self.grasping_config, 'obstacle_motion_mode', 'random'))
                 axis = 0 if str(getattr(self.grasping_config, 'obstacle_axis', 'y')) == 'x' else 1

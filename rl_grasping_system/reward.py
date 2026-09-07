@@ -68,7 +68,7 @@ def orientation_align(q_hand, q_target):
 # orient_align、z_axis_z 也算进奖励，而 z_axis_z=“手指朝上+1/朝下−1”，等于把 P1.2
 # 修复掉的反向信号以系数 1 重新注入奖励——这正是方向项修了却不见效的原因之一）。
 REWARD_KEYS = ('r_dist_xy', 'r_dist_z', 'r_orient', 'r_contact', 'r_close', 'r_grasp', 'r_success',
-               'r_obstacle', 'r_residual', 'r_avoid', 'r_step')
+               'r_obstacle', 'r_residual', 'r_residual_step', 'r_avoid', 'r_step')
 
 
 def _anchor_boost(w, d, d_target):
@@ -153,9 +153,15 @@ def reward_breakdown(state, prev_state, grasp_info, reward_config=None):
     # residual_norm（delta 模式 env 传 0）→ r_residual=0，完全不干扰旧训练。
     obstacle_dist = float(grasp_info.get('obstacle_dist', float('inf')))
     residual_norm = float(grasp_info.get('residual_norm', 0.0))
+    residual_l1 = float(grasp_info.get('residual_l1', residual_norm))  # ‖Δv‖₁（v25 L1 稀疏输入；旧环境无该键 → 回退范数）
     _d_range = max(1e-6, float(getattr(reward_config, 'obstacle_range', 0.15)))
     _r_obstacle = -float(getattr(reward_config, 'obstacle_w', 0.0)) * max(0.0, 1.0 - obstacle_dist / _d_range)
-    _r_residual = -float(getattr(reward_config, 'residual_reg_w', 0.0)) * residual_norm * residual_norm
+    # v25 残差稀疏三件套（经济学修复，见 docs/2026-09-08_残差饱和分析与奖励重塑方案.md）：
+    #   L2（残差幅度，保留旧语义） + L1（满幅残差成本与成功奖励同级） + 激活步罚（‖Δv‖>τ 当步再罚）
+    _r_residual = (-float(getattr(reward_config, 'residual_reg_w', 0.0)) * residual_norm * residual_norm
+                   - float(getattr(reward_config, 'residual_l1_w', 0.0)) * residual_l1)
+    _r_residual_step = -float(getattr(reward_config, 'residual_step_w', 0.0)) * float(
+        residual_norm > float(getattr(reward_config, 'residual_step_threshold', 0.02)))
 
     ee = np.asarray(state['ee_position'], dtype=float)
     obj = np.asarray(state['target_position'], dtype=float)
@@ -209,6 +215,7 @@ def reward_breakdown(state, prev_state, grasp_info, reward_config=None):
         parts['r_step'] = 0.0  # 2026-08-23: 抬升不计入训练步数，也不扣步惩罚（一致性）
         parts['r_obstacle'] = 0.0  # D2: 抬升阶段 RL 已成功，冻结障碍/残差惩罚（一致性）
         parts['r_residual'] = 0.0
+        parts['r_residual_step'] = 0.0
         if prev_state is not None:
             parts['r_dist_xy'] = 0.0
             parts['r_dist_z'] = 0.0
@@ -224,6 +231,7 @@ def reward_breakdown(state, prev_state, grasp_info, reward_config=None):
     # D2: 障碍接近惩罚 + 残差幅度正则（在 r_step 后统一写入；事件分支不覆盖——接近惩罚全程生效）
     parts['r_obstacle'] = _r_obstacle
     parts['r_residual'] = _r_residual
+    parts['r_residual_step'] = _r_residual_step
     # v16 奖励经济学：干净成功奖励——抓取成功当步若全程 0 碰撞 → +obstacle_clear_bonus
     # （上升沿一次性发放；碰撞累计由 env 传 grasp_info['obstacle_collision_count']）。
     # 经济学：让"绕开障碍再抓取"(+100+bonus) 严格优于"穿障成功"(+100) → 主动绕障。
@@ -240,6 +248,7 @@ def reward_breakdown(state, prev_state, grasp_info, reward_config=None):
         'potential': potential,
         'obstacle_dist': obstacle_dist,   # D2 诊断
         'residual_norm': residual_norm,   # D2 诊断
+        'residual_l1': residual_l1,       # v25 L1 稀疏诊断
     }
     return parts
 
