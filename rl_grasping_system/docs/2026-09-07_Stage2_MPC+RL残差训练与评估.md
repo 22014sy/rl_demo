@@ -123,8 +123,30 @@ python3 train_with_monitor.py --action-mode residual --nominal-mode mpc \
 - ~~极端场景 curriculum：训练 mix 中加入 static3/mixed3/mixed_z 难度……~~（已由 v25 5 场景 mix 实施）
 - 状态自适应上限：把残差 clip 上界与 MPC 可行域解耦（MPC 无解/低裕度时允许残差加大），dyn_target 与 static3 或可上探。（v25 仅做单向解耦——固定降幅；双向「MPC 无解时放大残差」留待 Stage 3）
 
+### 4.5 v25 评估回填（2026-09-08，n=30，cap=0.002 与训练一致）
+
+> 训练 2026-09-07 23:01→09-08 02:03（2h51m，319,488 步/2346 ep，成功率 60.0%@训练口径）；评估 10:50→11:24。
+> ⚠️ 模型实际保存于 `models/models/`（`--save-model` 与 `models_dir` 双重拼接遗留），已复制至 `models/` 标准位。
+
+| 场景 | v24 succ / coll / avg_coll | v25 succ / coll / avg_coll | 判定线 | 判定 |
+|---|---|---|---|---|
+| static | 96.7% / 0% / 0.0 | 93.3% / 0% / 0.0 | ≥96.7% | ❌ −3.4pp |
+| dyn_target | 73.3% / 0% / 0.0 | 50.0% / 0% / 0.0 | ≥83.3% | ❌ −23.3pp |
+| dyn_both | 86.7% / 3.3% / 0.5 | 73.3% / 0% / 0.0 | ≥86.7% | ❌ −13.4pp（coll 归零 ✅） |
+| static3 | 0.0% / 0% / 0.0 | 0.0% / 0% / 0.0 | >0% | ❌ 持平 |
+| mixed3 | 0.0% / **86.7%** / **40.03** | **20.0%** / **23.3%** / **0.40** | ≥13.3% & coll≤15% | ✅ 成功 / ❌ coll 未达 |
+| mixed_z | 13.3% / **80.0%** / **25.57** | 13.3% / **30.0%** / **1.33** | ≥13.3% & coll<10% | ✅ 成功 / ❌ coll 未达 |
+
+- **avg_residual_norm 恒 ≈0.0866** = 新 cap（0.002 → v_max 0.05 m/s）满幅范数 `√3×0.05`；`res_succ=res_fail` 全场景恒定 → **L1 稀疏三件套未生效，0.2165→0.0866 全部来自 cap 机械缩小**。
+- **核心正结果 = 高密度障碍安全属性质变**：mixed3 碰撞 40.03→0.40（**100×**）、mixed_z 25.57→1.33（**19×**），mixed3 首次从「0%/86.7% 灾难」变为「20%/23.3% 可用」——**cap 解耦（§4.4 项 1）机制验证成功**，是 v24 之后唯一真实增益。
+- **核心负结果 = ① L1 稀疏完全未生效**（纯奖励经济学拉不动热启动的满幅习惯，见方案文档 §10.3-2）；**② 简单场景回退**（static −3.4 / dyn_target −23.3 / dyn_both −13.4pp，len 拉长）——满幅残差仍干扰 MPC 最优轨迹 + 训练 mix 简单场景权重下降；**③ static3 仍 0%**——单向解耦的代价，MPC 卡死时残差 0.05 m/s 不足以突破。
+- **判定（修正为有条件 Go，详见方案文档 §10.4）**：字面 coll≤15% 未达 → 严格 No-Go；但 cap 解耦方向正确且增益巨大，保留该地基、**放弃「继续加 L1 权重」路线、转结构性门控**：
+  **v25b1 = 关键帧触发门控**（`Δv=gate(s)·π(s)`，MPC 预测碰撞/无解/接近目标时开放残差预算，MPC 无解时放大 cap），常态 gate≈0 同时治「简单场景回退」「饱和」「static3 无解」，即 §4.4 留白的双向解耦，已从可选升级为必要机制。
+
 ## 5. 产物与复现
 - 模型：`models/final_model_stage2_d2_v24_mpcres.zip` + `_vecnormalize.pkl`（git 跟踪；zip 10.3MB / pkl 6.7KB）
+- v25 模型：`models/final_model_stage2_d2_v25_mpcres_sparse.zip` + `_vecnormalize.pkl`（本阶段判定模型；git 跟踪）
+  - ⚠️ 训练时因 `--save-model` 与 `models_dir` 双重拼接存于 `models/models/`（v24 同），评估前已复制至 `models/` 标准位；后续训练入口应修掉该双重拼接。
 - 评估脚本：`scripts/mpc_plus_rl_eval.py`、`scripts/run_mpcres_eval.sh`（6 场景并行，n=30）
 - 结果 JSON：`results/mpc_plus_rl/*.json`（gitignored，`*.json` 规则；本表为唯一 git 记录）
 - 评估时间：主评估 2026-09-07 21:31→21:47；纯 MPC 复测 21:55→21:57
