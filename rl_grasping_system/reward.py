@@ -1,7 +1,8 @@
 """奖励函数（P3 保持逻辑不变，仅成功定义随环境重构）。
 
 P3 起抓取成功 = 手指被物体挡住合不上（见 environment._update_gripper_state），`grasp_info['is_grasped'] == grasp_info['grasp_success'] == (phase == 'closed')`，
-奖励结构不变：距离/方向势能塑形 + 接触 + grasp_reward + completion_reward + 时间惩罚。
+奖励结构：距离势能塑形 + 接触 + grasp_reward + 时间惩罚。2026-09-08 去冗余：
+completion_reward 恒 0（成功已并入 grasp_reward）、w_orient=0（3D 动作）方向项恒 0——两项均从 REWARD_KEYS 移除。
 """
 
 import numpy as np
@@ -67,7 +68,9 @@ def orientation_align(q_hand, q_target):
 # 放在返回值 b['diag'] 里，**绝不进入奖励**（P1.3 修复：此前 sum(values()) 把
 # orient_align、z_axis_z 也算进奖励，而 z_axis_z=“手指朝上+1/朝下−1”，等于把 P1.2
 # 修复掉的反向信号以系数 1 重新注入奖励——这正是方向项修了却不见效的原因之一）。
-REWARD_KEYS = ('r_dist_xy', 'r_dist_z', 'r_orient', 'r_contact', 'r_close', 'r_grasp', 'r_success',
+# 2026-09-08 去冗余：r_orient（w_orient=0、3D 动作下恒 0；切回 6D 时需加回本列表）与
+# r_success（completion_reward=0，成功奖励已并入 r_grasp）已移除。
+REWARD_KEYS = ('r_dist_xy', 'r_dist_z', 'r_contact', 'r_close', 'r_grasp',
                'r_obstacle', 'r_residual', 'r_residual_step', 'r_avoid', 'r_step')
 
 
@@ -181,7 +184,7 @@ def reward_breakdown(state, prev_state, grasp_info, reward_config=None):
         parts = {
             'r_dist_xy': p_xy - gamma * c_xy,
             'r_dist_z': p_z - gamma * c_z,
-            'r_orient': -p_o + gamma * o_gain,
+            # r_orient 已移除（w_orient=0 恒 0）；o_gain 仍用于 potential/diag 诊断
         }
         potential = c_xy + c_z - o_gain
     else:
@@ -189,7 +192,6 @@ def reward_breakdown(state, prev_state, grasp_info, reward_config=None):
         parts = {
             'r_dist_xy': -c_xy,
             'r_dist_z': -c_z,
-            'r_orient': o_gain,
         }
         potential = c_xy + c_z - o_gain
 
@@ -204,14 +206,12 @@ def reward_breakdown(state, prev_state, grasp_info, reward_config=None):
         parts['r_contact'] = reward_config.w_contact if contact_force >= reward_config.contact_force_threshold else 0.0
         parts['r_close'] = 0.0
         parts['r_grasp'] = reward_config.grasp_reward if grasp_info.get('is_grasped', False) else 0.0
-        parts['r_success'] = reward_config.completion_reward if grasp_info.get('grasp_success', False) else 0.0
     elif lift_active and not rising:
         # P4: 抬升阶段——任务已交给自动状态机，事件奖励不再重复发放；
         # 位置/方向塑形冻结（抬升由状态机执行，不该因"远离 pre-grasp 目标"被惩罚）
         parts['r_contact'] = 0.0
         parts['r_close'] = 0.0
         parts['r_grasp'] = 0.0
-        parts['r_success'] = 0.0
         parts['r_step'] = 0.0  # 2026-08-23: 抬升不计入训练步数，也不扣步惩罚（一致性）
         parts['r_obstacle'] = 0.0  # D2: 抬升阶段 RL 已成功，冻结障碍/残差惩罚（一致性）
         parts['r_residual'] = 0.0
@@ -219,14 +219,12 @@ def reward_breakdown(state, prev_state, grasp_info, reward_config=None):
         if prev_state is not None:
             parts['r_dist_xy'] = 0.0
             parts['r_dist_z'] = 0.0
-            parts['r_orient'] = 0.0
     else:
         # 训练普通步：接触为电平式（接近阶段鼓励碰到物体）；
         # 抓取/成功只在 grasp_success 上升沿一次性发放（成功当步 rising=True）
         parts['r_contact'] = reward_config.w_contact if contact_force >= reward_config.contact_force_threshold else 0.0
         parts['r_close'] = reward_config.close_trigger_reward if closing_rising else 0.0
         parts['r_grasp'] = reward_config.grasp_reward if rising else 0.0
-        parts['r_success'] = reward_config.completion_reward if rising else 0.0
     parts['r_step'] = -reward_config.step_penalty
     # D2: 障碍接近惩罚 + 残差幅度正则（在 r_step 后统一写入；事件分支不覆盖——接近惩罚全程生效）
     parts['r_obstacle'] = _r_obstacle

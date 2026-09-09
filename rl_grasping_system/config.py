@@ -49,6 +49,20 @@ class GraspingConfig:
     #   残差只能是"微调"（0.5s 内 ~2.5cm 修正量），不能"覆盖"MPC 刚算出的安全速度方向；
     #   delta 模式不受影响（仍用 max_ee_delta）。v24 恒 0.2165 的饱和根因即 clip 上界与此处同级。
     residual_delta_cap: float = 0.002
+    # v25b2 完整残差门控（2026-09-09，docs/2026-09-08 §13；关键帧触发 + 无解放大 + 最近点触发）：
+    #   residual_gate_enabled=True   关键帧门控总开关。True=Δv 仅在关键帧开放预算、常态 gate=0
+    #                                （治饱和/简单场景回退）；False=回退 v25b1 基础版行为（恒允许 cap 内残差）。
+    #   residual_gate_unstuck_cap   MPC 无解（SLSQP 异常/非 success）时残差 cap 放大到该值（m/步）。
+    #                                0.004 → v_max 0.1 m/s = 常态 2×（补 static3「MPC 卡死 → 残差硬绕」）。
+    #   residual_gate_nearest_point 触发判据：True=臂最近碰撞体到障碍表面距离（_get_obstacle_distance，
+    #                                覆盖整臂 link 碰撞，不只末端点）；False=末端点到障碍球心距离（v25b1 旧判据）。
+    residual_gate_enabled: bool = True
+    residual_gate_unstuck_cap: float = 0.004
+    residual_gate_nearest_point: bool = True
+    # v25b2「MPC 无解」判据修正（2026-09-09 冒烟实证）：SLSQP 在 static3 报告 success=True
+    # （找到"安全但到不了 hover"的局部解），res.success 不能判"到不了"。改用 MPC 预测序列
+    # 末步到 hover 的终端误差 terminal_err > 该阈值(m) 视为"MPC 到不了目标"→ 门控放大残差硬绕。
+    residual_gate_unstuck_terminal_err: float = 0.10
     max_orient_delta: float = 0.05  # 每步姿态增量上限 (rad，旋转向量模长上限；角速度 1.25rad/s)
     ik_error_hold: float = 0.02     # IK 位置误差超过该值(m)时保持当前位置（不朝不可达目标乱动）
     # Task3: 速度级 IK 阻尼系数（雅可比阻尼伪逆 dq=(JᵀJ+λ²I)⁻¹Jᵀv；越大越稳但末端速度实现率越低）
@@ -379,7 +393,9 @@ class RewardConfig:
     w_orient: float = 0.0             # 方向奖励权重：gain = w_orient * (-z_axis_z)。
                                       # 2026-08-22 调整: 3.0→0.0。当前 action_space_dim=3（姿态固定朝下），
                                       # 方向项是纯损耗（恒 -0.03/步，每 episode 白扣 ~6 分）无学习信号；
-                                      # 切回 6D 动作空间时恢复 3.0（此时姿态维度才需要方向梯度）。
+                                      # 2026-09-08 去冗余：w_orient=0 时 r_orient 恒 0，已从 reward.py
+                                      # REWARD_KEYS 移除；切回 6D 动作空间时恢复 3.0 并同步加回该键
+                                      # （此时姿态维度才需要方向梯度）。
 
     # --- 接触（真实物理接触）---
     w_contact: float = 5.0            # 手指接触物体奖励
@@ -390,8 +406,8 @@ class RewardConfig:
     contact_force_threshold: float = 0.1  # 接触判定阈值(N)
 
     # --- 抓取事件 ---
-    grasp_reward: float = 100.0         # 到位+夹紧+接触（is_grasped）
-    completion_reward: float = 0.0   # grasp_success（P1 中与 is_grasped 相同，见 MD）
+    grasp_reward: float = 100.0         # 到位+夹紧+接触（is_grasped）——成功奖励统一由该键发放
+                                        # （2026-09-08 去冗余：completion_reward 恒 0 已删除，见 reward.py REWARD_KEYS）
 
     # --- 时间惩罚 ---
     step_penalty: float = 0.05       # 轻时间惩罚，防止原地磨蹭。2026-08-22 调整: 0.1→0.05（200 步成本 -20→-10；
@@ -446,6 +462,9 @@ class RewardConfig:
     # 让策略学到"不确定时别碰 MPC 标称"（直接对应 dyn_target 残差轻微干扰问题）。
     residual_collision_threshold: float = 0.02     # 残差碰撞双倍罚判定阈值 (m/s)
     residual_collision_penalty_extra: float = 0.0  # 残差激活下碰撞的额外惩罚（默认 0 关闭；训练 CLI --residual-collision-penalty-extra 覆盖）
+    # ⚠️ 2026-09-08 v25 实证：L1 + 激活步罚 + 碰撞双倍罚三件套对残差稀疏化**完全无效**
+    # （§10.3-2：avg_residual_norm 恒 0.0866，残差仍满幅），已放弃纯权重路线、转结构性门控
+    # （v25b1 待实现）。上述字段默认 0 保留仅为消融/对照复现，勿再作主训方案。
 
 @dataclass
 class SystemConfig:

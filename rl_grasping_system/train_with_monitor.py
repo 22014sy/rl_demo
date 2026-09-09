@@ -107,6 +107,20 @@ def main():
     parser.add_argument('--residual-collision-penalty-extra', type=float, default=None,
                         help='v25 残差引起的碰撞双倍罚：collision 且 ‖Δv‖>τ 时在 collision-penalty 之外再叠加该罚'
                              '（≤0 有效，如 -10；None 用默认 0 关闭）')
+    # v25b2 完整残差门控（2026-09-09，docs/2026-09-08 §13）：关键帧触发 + 无解放大 + 最近点触发
+    parser.add_argument('--residual-gate-enabled', type=str, default='',
+                        help='v25b2 关键帧门控开关（True/False 覆盖 config.grasping.residual_gate_enabled='
+                             'True；空串用默认。False=回退 v25b1 基础版恒允许行为）')
+    parser.add_argument('--residual-gate-unstuck-cap', type=float, default=None,
+                        help='v25b2 MPC 无解时残差 cap 放大值 m/步（覆盖 config.grasping.residual_gate_unstuck_cap='
+                             '0.004；0.004 → v_max 0.1 m/s = 常态 2×，补 static3 硬绕预算）')
+    parser.add_argument('--residual-gate-nearest-point', type=str, default='',
+                        help='v25b2 gate 触发判据（True/False 覆盖 config.grasping.residual_gate_nearest_point='
+                             'True；True=臂最近碰撞体到障碍距离，覆盖整臂 link 碰撞）')
+    parser.add_argument('--residual-gate-unstuck-terminal-err', type=float, default=None,
+                        help='v25b2 MPC「到不了」判据阈值 m（覆盖 config.grasping.residual_gate_unstuck_terminal_err='
+                             '0.10；预测序列末步到 hover 误差 > 该值 → unstuck 放大残差。冒烟实证：SLSQP 报 '
+                             'success=True 但到不了，res.success 不能判无解，用 terminal_err）')
     parser.add_argument('--obstacle-w', type=float, default=-1.0,
                         help='D2 障碍接近惩罚权重（≥0 覆盖 config.reward.obstacle_w；<0 用默认 0.5）')
     parser.add_argument('--obstacle-clear-bonus', type=float, default=-1.0,
@@ -211,6 +225,15 @@ def main():
             config.reward.residual_collision_threshold = args.residual_collision_threshold
         if args.residual_collision_penalty_extra is not None:
             config.reward.residual_collision_penalty_extra = args.residual_collision_penalty_extra
+        # v25b2 完整残差门控（关键帧触发 + 无解放大 + 最近点触发）
+        if args.residual_gate_enabled:
+            config.grasping.residual_gate_enabled = args.residual_gate_enabled.lower() == 'true'
+        if args.residual_gate_unstuck_cap is not None:
+            config.grasping.residual_gate_unstuck_cap = args.residual_gate_unstuck_cap
+        if args.residual_gate_nearest_point:
+            config.grasping.residual_gate_nearest_point = args.residual_gate_nearest_point.lower() == 'true'
+        if args.residual_gate_unstuck_terminal_err is not None:
+            config.grasping.residual_gate_unstuck_terminal_err = args.residual_gate_unstuck_terminal_err
         if args.obstacle_w >= 0:
             config.reward.obstacle_w = args.obstacle_w
         if args.obstacle_clear_bonus >= 0:

@@ -52,6 +52,14 @@ class MpcNominal:
         self.solve_time = 0.0
         self.fallback_cnt = 0
         self.solve_cnt = 0
+        # v25b2 门控信号（每决策步 reference_velocity 更新）：solver_ok=SLSQP 求解成功（含无异常）；
+        # min_obstacle_dist=预测路径上末端参考点到最近障碍的最小距离（低裕度判据，∞=无障碍/未 attach）；
+        # terminal_err=预测序列末步到 hover（含目标外推）的误差——「MPC 到不了目标」判据
+        # （2026-09-09 实证：static3 下 SLSQP 报 success=True 但停在安全位到不了 hover，
+        #  res.success 不能判"无解"，terminal_err 才是）。
+        self.solver_ok = True
+        self.min_obstacle_dist = float('inf')
+        self.terminal_err = float('inf')
         self.reset()
 
     def bind(self, model, data, arm_joint_ids, body_id):
@@ -157,6 +165,7 @@ class MpcNominal:
             # 与 mpc_ur5_grasp.py 基线同口径：SLSQP 非 success（maxiter/ftol 未达标）的解仍接近最优，
             # 直接使用；仅求解器抛异常才降级 P 控制（fallback 只统计异常）。
             self._u_prev = res.x.reshape(N, 3)
+            u_used = self._u_prev
             v = self._u_prev[0].copy()
             if not res.success:
                 self.fallback_cnt += 1
@@ -167,10 +176,49 @@ class MpcNominal:
             n = float(np.linalg.norm(v))
             if n > vmax:
                 v = v * (vmax / n)
+            u_used = np.tile(v, (N, 1))
+        # v25b2 门控信号：solver_ok=False → 环境 gate 判定「MPC 无解」→ 放大残差预算（双向解耦）
+        self.solver_ok = (res is not None) and bool(getattr(res, 'success', False))
+        self.min_obstacle_dist = self._min_obstacle_dist_on_path(
+            u_used, ee, hover, tv, obs_list, ov_list)
+        self.terminal_err = self._terminal_err_on_path(u_used, ee, hover, tv)
         self.solve_time = time.time() - t0
         self.solve_cnt += 1
 
         return np.concatenate([v, np.zeros(3)]).astype(np.float64)
+
+    def _terminal_err_on_path(self, u, ee, hover, tv) -> float:
+        """预测序列末步到 hover（含目标外推）的误差（v25b2「MPC 到不了」判据）。
+
+        与 _predict 终端硬权重项同参考点（hover + tv·N·dt），保证 gate 的「到不了」
+        判据与 MPC 终端代价口径一致。
+        """
+        N, dt = self.N, self.dt
+        p = np.asarray(ee, dtype=float).ravel()[:3].copy()
+        for k in range(N):
+            p = p + u[k] * dt
+        return float(np.linalg.norm(p - (hover + tv * N * dt)))
+
+    def _min_obstacle_dist_on_path(self, u, ee, hover, tv, obs_list, ov_list) -> float:
+        """预测路径（决策序列回放）上末端参考点到最近障碍的最小距离（v25b2 gate 低裕度判据）。
+
+        与 _predict 同参考点（夹爪中部 p_col = p − [0,0,0.07]）与障碍外推（obs + ov·(k+1)·dt），
+        保证 gate 的「接近障碍」判据与 MPC 成本中避障项口径一致。
+        """
+        if not obs_list:
+            return float('inf')
+        N, dt = self.N, self.dt
+        p = np.asarray(ee, dtype=float).ravel()[:3].copy()
+        best = float('inf')
+        for k in range(N):
+            p = p + u[k] * dt
+            p_col = p - np.array([0.0, 0.0, 0.07])
+            for obs, ov in zip(obs_list, ov_list):
+                ok = obs + ov * (k + 1) * dt
+                d = float(np.linalg.norm(p_col - ok))
+                if d < best:
+                    best = d
+        return best
 
 
 def make_mpc_nominal(cfg) -> MpcNominal:

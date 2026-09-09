@@ -1,8 +1,9 @@
 """
 Task3: 训练"每个奖励项"事后回放图。
 
-读训练日志 JSON（每 episode 含 breakdown 七项：r_dist_xy/r_dist_z/r_orient/r_contact/r_grasp/r_success/r_step），
-绘制 2x4 面板：7 个奖励分项 + 总奖励，各自随 episode 的原始值 + 10-episode 移动平均。
+读训练日志 JSON（每 episode 含 breakdown 分项：r_dist_xy/r_dist_z/r_contact/r_close/r_grasp/
+r_obstacle/r_residual/r_residual_step/r_avoid/r_step），
+绘制 2x4 面板：10 个奖励分项 + 总奖励，各自随 episode 的原始值 + 10-episode 移动平均。
 
 用法：
     python3 plot_reward_breakdown.py [日志.json] [输出.png]
@@ -17,14 +18,20 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-KEYS = ['r_dist_xy', 'r_dist_z', 'r_orient', 'r_contact', 'r_grasp', 'r_success', 'r_step']
+# 2026-09-08 去冗余：r_orient/r_success 恒 0 已从 REWARD_KEYS 移除，故从回放图列表剔除；
+# 补齐当时缺失的 r_close，并按当前 REWARD_KEYS 扩展（对旧日志 bd.get(k,0.0) 容错）。
+KEYS = ['r_dist_xy', 'r_dist_z', 'r_contact', 'r_close', 'r_grasp',
+        'r_obstacle', 'r_residual', 'r_residual_step', 'r_avoid', 'r_step']
 TITLES = {
     'r_dist_xy': 'r_dist_xy (xy potential)',
     'r_dist_z': 'r_dist_z (height potential)',
-    'r_orient': 'r_orient (orientation)',
     'r_contact': 'r_contact (contact)',
+    'r_close': 'r_close (closing milestone)',
     'r_grasp': 'r_grasp (grasp)',
-    'r_success': 'r_success (completion)',
+    'r_obstacle': 'r_obstacle (obstacle penalty)',
+    'r_residual': 'r_residual (residual reg)',
+    'r_residual_step': 'r_residual_step (activation penalty)',
+    'r_avoid': 'r_avoid (clean success bonus)',
     'r_step': 'r_step (time penalty)',
 }
 

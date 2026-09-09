@@ -23,7 +23,7 @@ from config import GraspingConfig, RewardConfig
 from singularity_handler import SingularityHandler
 from action_wrapper import SafeActionWrapper
 from state import get_proprioceptive_state
-from reward import calculate_reward, reward_breakdown, REWARD_KEYS, quat_rotate_world_z, Q_APPROACH_DOWN
+from reward import reward_breakdown, REWARD_KEYS, quat_rotate_world_z, Q_APPROACH_DOWN
 from nominal_trajectory import make_nominal_trajectory, NominalTrajectory
 import ik
 
@@ -43,8 +43,10 @@ class GraspingEnv(gym.Env):
         self.reward_config = reward_config
         # Task3: 控制模式（velocity / position）
         self.control_mode = str(getattr(grasping_config, 'control_mode', 'velocity'))
+
         # D1: 残差策略 action_mode（'delta' / 'residual'）
         self.action_mode = str(getattr(grasping_config, 'action_mode', 'delta')).lower()
+
         # D1: 动态化环境地基开关
         self.dynamic_target_enabled = bool(getattr(grasping_config, 'dynamic_target_enabled', False))
         self.obstacle_enabled = bool(getattr(grasping_config, 'obstacle_enabled', False))
@@ -567,8 +569,14 @@ class GraspingEnv(gym.Env):
             # v25 残差预算与 MPC 解耦（2026-09-08）：residual 分支用独立 cap（config.residual_delta_cap，
             # 0.002→v_max_res=0.05m/s = MPC v_max 的 40%），残差只能是"微调"不能"覆盖" MPC 标称；
             # delta 模式保持旧语义（max_ee_delta=0.125）。v24 恒 0.2165 饱和的 clip 上界即来自此。
+            # v25b2 双向解耦（2026-09-09）：MPC「到不了」（unstuck）时 clip 同步放大到
+            # residual_gate_unstuck_cap（0.004→0.1m/s）——否则动作层先 clip 死、gate 放大无效
+            # （static3 冒烟实证：res 恒 0.0866 = 常态 cap 满幅）。
             _pos_cap = (float(getattr(self.grasping_config, 'residual_delta_cap', 0.002))
                         if self.action_mode == 'residual' else self.grasping_config.max_ee_delta)
+            if self.action_mode == 'residual' and self._residual_unstuck():
+                _pos_cap = max(_pos_cap, float(getattr(self.grasping_config,
+                                                       'residual_gate_unstuck_cap', 0.004)))
             pos_delta = np.clip(a[:3], -_pos_cap, _pos_cap)
             ori_delta = (np.clip(a[3:6], -self.grasping_config.max_orient_delta,
                                  self.grasping_config.max_orient_delta)
@@ -583,7 +591,7 @@ class GraspingEnv(gym.Env):
                 self._v_nominal = self.nominal_trajectory.reference_velocity(
                     current_state['ee_position'], self.target_pos, T,
                     target_vel=getattr(self, '_dyn_target_vel', None))
-                v_raw = self._v_nominal + _res_delta
+                v_raw = self._apply_residual_gate(self._v_nominal, _res_delta, T)
             else:
                 self._v_nominal = np.zeros(6)
                 v_raw = _res_delta
@@ -783,7 +791,10 @@ class GraspingEnv(gym.Env):
         # D2/评估：本步残差幅度 ‖Δv‖ 暴露（residual 模式真值；delta/position 恒 0）——
         # 供 evaluate.py 做 §3.5-5「成功=小残差/失败=大残差」分工证据统计
         self._last_residual_norm = float(np.linalg.norm(_res_delta))
-        reward = calculate_reward(new_state, self.prev_state, grasp_info, self.reward_config)
+        # 2026-09-08 去冗余：reward_breakdown 每步只算一次（calculate_reward 即其
+        # REWARD_KEYS 之和），parts 同时供本步奖励与 episode_breakdown 累计复用
+        parts = reward_breakdown(new_state, self.prev_state, grasp_info, self.reward_config)
+        reward = float(sum(parts[k] for k in REWARD_KEYS))
         # Task3 B: 奇异单步惩罚并入本步奖励（RL 可感知）
         reward += self._singularity_penalty
         # D2: 臂-障碍碰撞——当步额外惩罚 + 连续碰撞 streak（接近惩罚已由 r_obstacle 提供梯度，
@@ -806,9 +817,7 @@ class GraspingEnv(gym.Env):
         else:
             self._obstacle_collision_streak = 0
         self.task_state['episode_reward'] += reward
-        # Task3: 奖励分项累计（reward_breakdown 一次计算，calculate_reward 即其 REWARD_KEYS 之和，
-        # 避免重复计算；用于训练结束后的"每个奖励项"事后回放）
-        parts = reward_breakdown(new_state, self.prev_state, grasp_info, self.reward_config)
+        # Task3: 奖励分项累计（复用本步 reward_breakdown 的 parts；用于训练结束后的"每个奖励项"事后回放）
         for k in REWARD_KEYS:
             self.task_state['episode_breakdown'][k] += parts[k]
         self.task_state['episode_breakdown']['r_singularity'] += self._singularity_penalty
@@ -1318,6 +1327,129 @@ class GraspingEnv(gym.Env):
         if best == float('inf'):
             return float('inf')
         return max(0.0, best - r)
+
+    def _residual_unstuck(self) -> bool:
+        """v25b2「MPC 到不了」判定：残差预算放大的关键帧信号（apply_action 动作层 clip 与 gate 共用）。
+
+        判据（2026-09-09 冒烟实证修正）：SLSQP 在 static3 报 success=True 但停在安全位到不了 hover，
+        res.success 不能判"无解" → 用 MPC 预测序列末步到 hover 的 terminal_err > 阈值，
+        或 SLSQP 异常/非 success。velocity_field 标称无状态 → 恒 False。
+        """
+        gcfg = self.grasping_config
+        if not bool(getattr(gcfg, 'residual_gate_enabled', False)):
+            return False
+        nt = getattr(self, 'nominal_trajectory', None)
+        if nt is None or not hasattr(nt, 'solver_ok'):
+            return False
+        unstuck_term = float(getattr(gcfg, 'residual_gate_unstuck_terminal_err', 0.10))
+        return (not bool(nt.solver_ok)) or (float(nt.terminal_err) > unstuck_term)
+
+    def _apply_residual_gate(self, nominal_v: np.ndarray, residual_v: np.ndarray, dt: float) -> np.ndarray:
+        """v25b2 关键帧触发残差门控：Δv 只在「关键帧」开放预算，其余时刻 gate=0。
+
+        设计原则（docs/2026-09-08 §13）：
+        1) 残差速度有单独 cap，常态 gate=0（简单场景零干扰、残差真正稀疏）；
+        2) terminal（closing/成功）强制 residual=0，安全主路径优先；
+        3) MPC 无解（SLSQP 异常或非 success）→ 放大 cap（unstuck），给残差硬绕预算（补 static3）；
+        4) 臂最近点-障碍距离 < D_SAFE → 切平面投影（禁朝障碍法向推；近距清零）。
+        residual_gate_enabled=False 时回退 v25b1 基础版行为（恒允许 cap 内残差 + 末端点投影）。
+        """
+        if str(getattr(self, 'action_mode', 'delta')).lower() != 'residual':
+            return np.asarray(nominal_v, dtype=float).reshape(6) + np.asarray(residual_v, dtype=float).reshape(6)
+
+        nominal_v = np.asarray(nominal_v, dtype=float).reshape(6).copy()
+        residual_v = np.asarray(residual_v, dtype=float).reshape(6).copy()
+        gcfg = self.grasping_config
+
+        # terminal：安全主路径优先，残差不覆盖最终控制。
+        if self.gripper_phase == 'closing' or bool(self.task_state.get('grasp_success', False)):
+            residual_v *= 0.0
+            return nominal_v + residual_v
+
+        gate_enabled = bool(getattr(gcfg, 'residual_gate_enabled', False))
+        residual_cap = float(getattr(gcfg, 'residual_delta_cap', 0.002)) / max(float(dt), 1e-6)
+
+        # ---- v25b2 关键帧门控 ----
+        if gate_enabled:
+            # MPC 求解状态（仅 mpc 标称有状态；velocity_field 无 solver_ok → 视为有解）。
+            # 「MPC 到不了」判据（2026-09-09 实证）：SLSQP 在 static3 报 success=True 但停在安全位
+            # 到不了 hover（res.success 不能判无解）→ 用预测序列末步 terminal_err > 阈值判定。
+            unstuck = self._residual_unstuck()
+            if unstuck:
+                # MPC 无解 → 放大残差 cap（双向解耦：残差获得硬绕预算，补 static3「MPC 卡死」）
+                unstuck_cap = float(getattr(gcfg, 'residual_gate_unstuck_cap', 0.004)) / max(float(dt), 1e-6)
+                if unstuck_cap > residual_cap:
+                    residual_cap = unstuck_cap
+
+            # 障碍接近触发判据：臂最近碰撞体到障碍表面距离（默认，覆盖整臂 link 碰撞）
+            # 或末端点到障碍球心距离（v25b1 旧判据）。
+            safety_margin = float(getattr(gcfg, 'mpc_nominal_d_safe', 0.20))
+            use_nearest = bool(getattr(gcfg, 'residual_gate_nearest_point', True))
+            if use_nearest:
+                d_obs = self._get_obstacle_distance()          # 臂最近碰撞体到障碍表面距离
+                near = d_obs < safety_margin
+            else:
+                ee_pos = np.asarray(self._get_end_effector_position(), dtype=float)
+                obs_positions = self._get_obstacle_positions()
+                near = bool(obs_positions) and min(
+                    float(np.linalg.norm(np.asarray(p, dtype=float) - ee_pos)) for p in obs_positions
+                ) < safety_margin
+
+            # 残差速度 cap（常态或 unstuck 放大后）
+            residual_speed = float(np.linalg.norm(residual_v[:3]))
+            if residual_speed > residual_cap > 0.0:
+                residual_v[:3] *= residual_cap / residual_speed
+
+            if near and not unstuck:
+                # 正常预算下的接近避障：切平面投影 + 近距清零（v25b1 语义保留）
+                ee_pos = np.asarray(self._get_end_effector_position(), dtype=float)
+                obs_positions = self._get_obstacle_positions()
+                nearest_obs = min(obs_positions, key=lambda p: float(
+                    np.linalg.norm(np.asarray(p, dtype=float) - ee_pos)))
+                nearest_vec = np.asarray(nearest_obs, dtype=float) - ee_pos
+                nearest_dist = float(np.linalg.norm(nearest_vec))
+                if nearest_dist > 1e-8:
+                    n_vec = nearest_vec / nearest_dist
+                    residual_v[:3] = residual_v[:3] - n_vec * float(np.dot(residual_v[:3], n_vec))
+                    if nearest_dist < safety_margin * 0.6:
+                        residual_v *= 0.0
+            elif unstuck:
+                # MPC 无解：残差预算已放大（硬绕）；切平面投影仍保留（禁撞，允许横向/上方绕行）
+                ee_pos = np.asarray(self._get_end_effector_position(), dtype=float)
+                obs_positions = self._get_obstacle_positions()
+                if obs_positions:
+                    nearest_obs = min(obs_positions, key=lambda p: float(
+                        np.linalg.norm(np.asarray(p, dtype=float) - ee_pos)))
+                    nearest_vec = np.asarray(nearest_obs, dtype=float) - ee_pos
+                    nearest_dist = float(np.linalg.norm(nearest_vec))
+                    if nearest_dist > 1e-8:
+                        n_vec = nearest_vec / nearest_dist
+                        residual_v[:3] = residual_v[:3] - n_vec * float(np.dot(residual_v[:3], n_vec))
+            else:
+                # 常态：非关键帧 → gate=0，残差清零（治饱和 / 简单场景回退）
+                residual_v *= 0.0
+        else:
+            # ---- v25b1 基础版行为（residual_gate_enabled=False 兼容回退）----
+            residual_speed = float(np.linalg.norm(residual_v[:3]))
+            if residual_speed > residual_cap > 0.0:
+                residual_v[:3] *= residual_cap / residual_speed
+            ee_pos = np.asarray(self._get_end_effector_position(), dtype=float)
+            obs_positions = self._get_obstacle_positions()
+            if obs_positions:
+                nearest_obs = min(obs_positions, key=lambda p: float(
+                    np.linalg.norm(np.asarray(p, dtype=float) - ee_pos)))
+                nearest_vec = np.asarray(nearest_obs, dtype=float) - ee_pos
+                nearest_dist = float(np.linalg.norm(nearest_vec))
+                safety_margin = float(getattr(gcfg, 'mpc_nominal_d_safe', 0.20))
+                if nearest_dist < safety_margin and nearest_dist > 1e-8:
+                    n_vec = nearest_vec / nearest_dist
+                    # 切平面投影只作用于平移速度分量 [dx,dy,dz]（障碍法向为 3 维；
+                    # 姿态分量与法向无关，参与 dot 会维度不匹配——2026-09-08 修复）
+                    residual_v[:3] = residual_v[:3] - n_vec * float(np.dot(residual_v[:3], n_vec))
+                    if nearest_dist < safety_margin * 0.6:
+                        residual_v *= 0.0
+
+        return nominal_v + residual_v
 
     def _arm_obstacle_geoms(self) -> set:
         """机械臂 + 夹爪的全部 geom id（排除桌面/目标 cube/全部障碍 body）——D2 臂-障碍碰撞检测用。惰性缓存。"""
