@@ -14,6 +14,7 @@ import mujoco
 import mujoco.viewer as mjviewer
 import gymnasium as gym
 from gymnasium import spaces
+from collections import deque
 from typing import Dict, Tuple, Optional, Any
 import logging
 import os
@@ -386,6 +387,9 @@ class GraspingEnv(gym.Env):
 
         # D6 感知噪声：episode 起始感知估计 = 真值（首次不落后，避免初始化偏差）
         self._perceived_pos = None
+        # 感知噪声专用 RNG：与 np_random（障碍随机游走）隔离。否则加噪每步多消耗 4 个随机数，
+        # 会把障碍序列整体推偏 → oracle 与加噪臂跑的不是同一条轨迹，配对对比失效。
+        self._perc_rng = np.random.default_rng(seed if seed is not None else None)
         
         # 重置episode监控
         self.episode_start_time = time.time()
@@ -432,6 +436,15 @@ class GraspingEnv(gym.Env):
         self._v_smooth = np.zeros(6)
         # Task3 sim-to-real 动力学匹配：速度环加速度前馈用上一物理步 dq
         self._dq_prev = np.zeros(6)
+        # 模型失配扰动：执行速度纯传输延迟缓冲（D=0 时 None = 原行为）。
+        # ctrl_delay_randomize=True 时每 episode 从 U[0, ctrl_delay_max_steps] 抽一个延迟
+        # （域随机化训练：让残差学会补偿 plant 执行延迟）；否则用固定 ctrl_delay_steps。
+        if getattr(self.grasping_config, 'ctrl_delay_randomize', False):
+            _dmax = int(getattr(self.grasping_config, 'ctrl_delay_max_steps', 0))
+            _d = int(self.np_random.integers(0, _dmax + 1)) if _dmax > 0 else 0
+        else:
+            _d = int(getattr(self.grasping_config, 'ctrl_delay_steps', 0))
+        self._cmd_delay_buf = deque(np.zeros((_d, 6))) if _d > 0 else None
 
         # D1: 标称轨迹重置 + 当前标称速度槽位清零（residual 模式每决策步刷新）
         if self.nominal_trajectory is not None:
@@ -693,6 +706,13 @@ class GraspingEnv(gym.Env):
             _Mfull = np.zeros((self.model.nv, self.model.nv))
             mujoco.mj_fullM(self.model, self.data, _Mfull)   # (model, data, dst)：解压压缩对称阵后取 arm 子块
             M_eff = _Mfull[np.ix_(arm_dof, arm_dof)]
+            # 模型失配扰动：真正送进 velocity_ik 的速度延后 D 个决策步（MPC 假设即时执行，延迟=plant 滞后）。
+            # 放消费点而非产生点，保证奇异/接触保护等覆写也被一致延迟；D=0 时跳过 = 逐位不变。
+            _buf = getattr(self, '_cmd_delay_buf', None)
+            if _buf is not None:
+                _vel_now = np.asarray(self._vel_target, dtype=float).copy()
+                self._vel_target = _buf.popleft()
+                _buf.append(_vel_now)
             for _ in range(ctrl_cycles):
                 dq = ik.velocity_ik(self.model, self.data, self.end_effector_id,
                                     self._vel_target, arm_dof, lam)
@@ -1645,13 +1665,16 @@ class GraspingEnv(gym.Env):
         true = self.target_pos.copy()
         if std <= 0.0 and dropout <= 0.0:
             return true
+        rng = getattr(self, '_perc_rng', None)
+        if rng is None:                      # 未走 reset 的兜底路径
+            rng = self.np_random
         if self._perceived_pos is None:
             # 首次（reset 后）：以当前真值+噪声为初始估计，避免初始化偏差
-            est = true + self.np_random.normal(0.0, std, 3) if std > 0.0 else true.copy()
+            est = true + rng.normal(0.0, std, 3) if std > 0.0 else true.copy()
         else:
             est = self._perceived_pos.copy()  # 默认零阶保持（漏检语义）
-            if float(self.np_random.uniform()) >= dropout:
-                est = true + self.np_random.normal(0.0, std, 3)  # 正常检测：真值+噪声
+            if float(rng.uniform()) >= dropout:
+                est = true + rng.normal(0.0, std, 3)  # 正常检测：真值+噪声
         self._perceived_pos = est.copy()
         return est.copy()
 

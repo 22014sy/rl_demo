@@ -31,6 +31,13 @@ class GraspingConfig:
     velocity_kd: List[float] = (5.0, 5.0, 5.0, 4.0, 4.0, 6.0)
     # Task3 抖动抑制 B：RL 动作一阶低通平滑（0=不平滑、1=全跟随新动作；0.3 消除决策步跳变冲击，对应 MoveIt Servo smoothing）
     action_smoothing_alpha: float = 0.7
+    # 模型失配扰动（评估用，默认关闭=0）：真正送进 velocity_ik 的末端速度延后 D 个决策步执行——
+    # 模拟 plant 执行延迟（MPC 内部假设"即时执行"，延迟即标称模型误差）。D=0 时逐位不变。
+    ctrl_delay_steps: int = 0
+    # 域随机化训练：每 episode 随机延迟 U[0, ctrl_delay_max_steps]（让残差学会补偿执行延迟）。
+    # 默认关闭；仅用于失配域鲁棒化训练，不影响既有 checkpoint 的 D=0 行为。
+    ctrl_delay_randomize: bool = False
+    ctrl_delay_max_steps: int = 0
     render_gui: bool = True  # 并行改造(2026-08-22): 训练 worker 一律无头（多进程下每进程开窗会拖垮训练）。想看训练画面：训练脚本主进程单独建演示环境 render_gui=True，定期用当前策略播放
     render_interval: int = 1  # 每隔多少步显示一次画面
     render_pause_sec: float = 0.001  # 刷新窗口时的短暂暂停

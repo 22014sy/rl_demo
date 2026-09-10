@@ -63,6 +63,9 @@ def main():
     parser.add_argument('--nominal-mode', type=str, default='', choices=['', 'velocity_field', 'mpc'],
                         help='P2c 标称层类型（residual 模式生效）：velocity_field=速度场替身（默认，O(1) 快）；'
                              'mpc=末端级滚动最优控制（scipy SLSQP，自带障碍避障软约束，见 mpc_nominal.py）')
+    parser.add_argument('--ctrl-delay-max', type=int, default=-1,
+                        help='模型失配域随机化：每 episode 随机执行延迟 U[0, N] 决策步（>-1 开启；'
+                             '训练残差补偿 plant 执行延迟/模型误差）。默认关闭=原行为')
     parser.add_argument('--dynamic-target', action='store_true',
                         help='D1 动态目标（L2）：物体 per-step 沿 target_motion_axis 往返运动')
     parser.add_argument('--target-vel', type=float, default=0.0,
@@ -179,6 +182,11 @@ def main():
             config.grasping.nominal_mode = args.nominal_mode
             logger.info(f"🎛️ P2c 标称层：nominal_mode={config.grasping.nominal_mode}"
                         f"（mpc=末端级滚动最优控制，velocity_field=速度场替身）")
+        if args.ctrl_delay_max >= 0:
+            config.grasping.ctrl_delay_randomize = args.ctrl_delay_max > 0
+            config.grasping.ctrl_delay_max_steps = max(0, args.ctrl_delay_max)
+            if args.ctrl_delay_max > 0:
+                logger.info(f"🌀 模型失配域随机化：每 episode 执行延迟 U[0,{args.ctrl_delay_max}] 决策步")
         if args.dynamic_target:
             config.grasping.dynamic_target_enabled = True
             if args.target_vel > 0:

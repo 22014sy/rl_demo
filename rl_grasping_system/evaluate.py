@@ -351,6 +351,21 @@ def main():
                         help='D6 感知噪声：目标位置高斯噪声标准差 (m)（模拟相机深度反投影误差）')
     parser.add_argument('--perception-dropout', type=float, default=0.0,
                         help='D6 感知噪声：随机漏检概率 (0~1)（漏检时目标估计零阶保持上次值）')
+    parser.add_argument('--seed', type=int, default=None,
+                        help='固定 RNG 种子（跨配置 A/B 同随机源，使对比可配对）；默认不固定')
+    # 2026-09-10：残差预算口径覆盖。HEAD 的 config 默认 residual_delta_cap=0.002（v25 解耦后）
+    # 且 residual_gate_enabled=True（v25b2 门控），二者都会改变 pre-gating 模型（如 v18_p3f）
+    # 的语义——用 HEAD 默认评 v18 会测出远低于其训练口径的成功率。复现头条数字须把这俩调回：
+    #   --residual-delta-cap 0.005 --no-residual-gate（= cadd00e 口径，残差用 max_ee_delta 满预算）
+    parser.add_argument('--residual-delta-cap', type=float, default=None,
+                        help='覆盖残差每步位置增量上限(m)；None=用 config 默认（HEAD=0.002）。'
+                             '评 pre-gating 模型须传 0.005 对齐 cadd00e 口径')
+    parser.add_argument('--no-residual-gate', action='store_true',
+                        help='关闭 v25b2 关键帧残差门控（回退 v25b1/无门控语义）。'
+                             '评 pre-gating 模型（v18/v11/v24）须开启本开关')
+    parser.add_argument('--no-ik-check', action='store_true',
+                        help='关闭标称层 IK 可达性检查（HEAD 新增，默认开）。该检查判定 hover 不可达时'
+                             '返回零速度→臂停住；动态目标可能误触发导致超时。评 pre-gating 模型可关闭')
     
     args = parser.parse_args()
     
@@ -411,6 +426,13 @@ def main():
             config.grasping.perception_noise_std = args.perception_noise_std
         if args.perception_dropout > 0:
             config.grasping.perception_dropout = args.perception_dropout
+        # 残差预算口径覆盖（2026-09-10）：复现 pre-gating 模型须显式对齐 cadd00e 语义
+        if args.residual_delta_cap is not None:
+            config.grasping.residual_delta_cap = float(args.residual_delta_cap)
+        if args.no_residual_gate:
+            config.grasping.residual_gate_enabled = False
+        if args.no_ik_check:
+            config.grasping.nominal_ik_check = False
         # 物体位置：默认固定（对齐 train_with_monitor 无 --position-random 的行为）；
         # --position-random 时围绕 object_fixed_pos ±radius 随机（收窄 workspace_bounds）
         if args.position_random:
@@ -434,7 +456,11 @@ def main():
         
         # 加载模型
         agent, env = load_model(args.model_path, config)
-        
+
+        # 固定 RNG（跨配置同随机源）；后续 episode reset 不再重播种，沿用同一流
+        if args.seed is not None:
+            env.reset(seed=int(args.seed))
+
         # 评估模型
         results = evaluate_model(agent, env, args.n_episodes, args.render,
                                  zero_residual=args.zero_residual)

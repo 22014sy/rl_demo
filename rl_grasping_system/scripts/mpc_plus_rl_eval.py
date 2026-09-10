@@ -151,6 +151,11 @@ def main():
                          "重跑 v24 同口径对照传 0.005 恢复旧 clip）")
     ap.add_argument("--d-safe", type=float, default=None,
                     help="覆盖 mpc_nominal_d_safe（默认 config 0.20；验证实验：调小验证 static3 物理可绕）")
+    ap.add_argument("--ctrl-delay-steps", type=int, default=0,
+                    help="模型失配扰动：执行速度延后 D 个决策步（plant 传输延迟；D=0 原行为）。"
+                         "验证实验：纯 MPC vs MPC+RL 谁对执行延迟更鲁棒")
+    ap.add_argument("--seed", type=int, default=None,
+                    help="固定环境随机源（障碍随机游走/场景采样）→ 跨模型 A/B 可复现；默认不固定")
     ap.add_argument("--save-results", type=str, default="")
     args = ap.parse_args()
     sc = SCENE_CFG[args.scene]
@@ -169,6 +174,8 @@ def main():
         g.residual_delta_cap = args.residual_delta_cap   # v25：残差预算覆盖（默认 config 0.002）
     if args.d_safe is not None:
         g.mpc_nominal_d_safe = args.d_safe               # v25b2 验证：D_SAFE 覆盖
+    if args.ctrl_delay_steps is not None:
+        g.ctrl_delay_steps = args.ctrl_delay_steps       # 模型失配：执行延迟扰动
 
     # ---- 目标/障碍场景（与 mpc_nominal_verify.py 同口径） ----
     g.dynamic_target_enabled = sc["dyn_target"]
@@ -191,6 +198,8 @@ def main():
         g.obstacle_on_nominal_path = True
 
     env = GraspingEnv(g, cfg.reward)
+    if args.seed is not None:
+        env.reset(seed=int(args.seed))   # 固定 RNG（跨模型 A/B 同随机源）；后续 episode reset 不再重播种
     agent = None
     if args.model and not args.zero_residual:
         agent = GraspingAgent(cfg.network, cfg.training, model_path=args.model)
