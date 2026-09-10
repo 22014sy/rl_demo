@@ -1,9 +1,15 @@
 # 强化学习抓取系统
 
-这是一个独立的、基于强化学习的机械臂抓取系统，采用**混合残差架构**（MoveIt 标称轨迹 + PPO 残差修正）
+这是一个独立的、基于强化学习的机械臂抓取系统，采用**混合残差架构**（自实现速度场标称层 + PPO 残差修正）
 训练 UR5e + Robotiq 2F-85 执行"到达并抓取"任务（MuJoCo 仿真，动态目标 + 动态障碍避障）。
 
+> ⚠️ 标称层是**本仓库自实现的仿真速度场 / 运动学 MPC**，**不是 MoveIt**。
+> MoveIt 只出现在部署端设计（见 `docs/RL_DEPLOY_CONTRACT.md` 与顶层 `docs/简历项目知识整理.md` §12）。
+
 ## 📊 核心结果：三路消融对比（2026-08-28）
+
+> 口径：**确定性**评估（`deterministic=True`）、**n=30/场景**、物体位置固定；三路模型均在当前环境
+> （扩大桌面 0.70m）**未重训**下评估。证据：`results/ablation/summary_table.txt` + `results/ablation/*.json`。
 
 混合残差架构（`v = v_nominal(t) + Δv`）在三类场景下**均优于**端到端 PPO 与纯标称（零残差）：
 
@@ -28,6 +34,27 @@ bash scripts/run_ablation.sh     # 三路 × 三场景 × n=30 评估 → result
 python scripts/plot_ablation.py  # 生成 results/ablation_compare.png 对比图
 ```
 
+## 🧪 第二代：MPC 标称层 + 残差（部分成功／进行中）
+
+标称层已升级为**运动学 MPC**（SLSQP 滚动最优控制，`mpc_nominal.py`）。评估脚本
+`scripts/mpc_plus_rl_eval.py`（支持 `--zero-residual` 纯标称、`--nominal-mode mpc`、
+`--ctrl-delay-steps` 执行延迟扰动、`--seed` 固定随机源）。
+
+| 场景 | v24（cap 未解耦） | v25b2（cap 解耦+门控） | 纯 MPC（n=30） |
+|---|---|---|---|
+| 动态目标 | 73.3% / 0% coll | 80.0% / 0% coll | **83.3%** / 0% coll |
+| 动态目标+障碍 | 86.7% / 3.3% coll | 76.7% / 0% coll | **90.0%** / 0% coll |
+| mixed3（高密度） | 0% / 86.7% coll / avg 40.03 | 6.7% / 36.7% coll / **avg 1.17** | — |
+| mixed_z | 13.3% / 80% coll / avg 25.57 | 13.3% / 33.3% coll / **avg 0.73** | — |
+| static3 | 0% | 0% | — |
+
+**诚实结论**（完整版见 `../docs/简历项目知识整理.md` §0/§9 与 `../docs/数字真值表_20260910.md`）：
+- cap 解耦带来**安全增益**：高密度障碍平均碰撞 **34×↓**（40.03→1.17）；
+- **但不是成功率增益**：mixed3 成功 0%→6.7%，mixed_z 持平；
+- **残差未在成功率上打赢纯 MPC**（动态+障碍 76.7% vs 90.0%）；
+- **static3 全版本 0%**（根因指向 MPC `D_SAFE` 几何拒行，未解）。
+- ⚠️ 评估脚本此前**无 seed 控制**，存在 ±8~17pp 采样噪声；「高几个百分点」级结论不可信。
+
 ## 系统特点
 
 ### 🎯 核心功能
@@ -38,9 +65,9 @@ python scripts/plot_ablation.py  # 生成 results/ablation_compare.png 对比图
 - **完整监控**: 训练进度、成功率、奇异点检测等
 
 ### 🔧 技术架构
-- **环境**: MuJoCo + Panda机械臂
-- **任务**: 到达并抓取固定位置物体
-- **算法**: PPO with 完整归一化
+- **环境**: MuJoCo + UR5e + Robotiq 2F-85
+- **任务**: 到达并抓取（动态目标 / 动态障碍），混合残差架构
+- **算法**: PPO（Stable-Baselines3）+ VecNormalize 完整归一化
 - **监控**: 实时训练监控和可视化
 - **部署**: 云端无头训练支持
 
@@ -72,8 +99,8 @@ python evaluate.py --model_path models/final_model.zip
 ### 核心模块
 
 #### 1. 环境模块 (`environment.py`)
-- **PandaGraspingEnv**: 基于MuJoCo的抓取环境
-- **状态空间**: 关节位置/速度/力矩、末端执行器位置/方向/速度、夹爪状态、目标信息、相对接近姿态四元数（P2-2：`q_target_approach ⊗ q_ee⁻¹`，观测 58 维；P3 追加 1 维夹爪状态机相位）
+- **GraspingEnv**: 基于 MuJoCo 的抓取环境（UR5e + Robotiq 2F-85）
+- **状态空间**: **67 维**——关节位置/速度/力矩(18) + 夹爪(3) + 末端位姿/速度(13) + 目标(7) + 诊断/接触力(7) + 相对接近姿态四元数(4，P2-2：`q_target_approach ⊗ q_ee⁻¹`) + 夹爪相位(1) + **标称参考速度(6)** + **障碍相对位姿/速度(6)**
 - **动作空间**: 末端位姿增量（action_space_dim=6 → [dx,dy,dz,dax,day,daz]；=3 → [dx,dy,dz] 仅位置、姿态固定朝下），经 DLS IK 反解为关节位置伺服目标；夹爪由环境内"近距自动闭合状态机"驱动（RL 不再输出肌腱命令）
 - **奖励函数**: 距离势能塑形、方向项、接触、抓取/完成奖励、时间惩罚（P3：抓取成功 = 手指被物体挡住合不上）
 
@@ -160,7 +187,7 @@ step_penalty: float = 0.01         # 时间惩罚
 > 0.005 仍有 ~6% 滞后滑移，0.003 时物体 100% 刚性跟随、~494 步到位），
 > 到位或失夹/超时即结束 episode；成功时在 MuJoCo 原生窗口左上角叠加显示 "succeed"。
 > P4 物理修复（2026-08-20）：`max_steps` 只计抬升前步数（抬升是自动阶段 ~494 步，不消耗
-> RL 预算，见 `environment.step` 的 truncated 判定）；`panda.xml` 指尖衬垫接触加硬
+> RL 预算，见 `environment.step` 的 truncated 判定）；`ur5e_robotiq_cube.xml` 指尖衬垫接触加硬
 > （`solref=0.001/0.999`）+ 主衬垫加宽加高，使 64g 立方体在抬升中不蠕动倾覆（默认软接触
 > 下 ~0.075m 即滑脱；加硬 + `lift_speed=0.003` 后稳定跟随 100%、宽度不滑脱）。
 

@@ -21,7 +21,7 @@ robotic_arm_control/
 │   ├── qwen_vl_test.py        # Qwen-VL-Chat测试脚本
 │   └── check_model.py         # 模型配置检查脚本
 ├── rl_grasping_system/        # 独立的强化学习抓取系统
-│   ├── environment.py         # Panda机械臂抓取环境
+│   ├── environment.py         # UR5e + Robotiq 2F-85 抓取环境
 │   ├── agent.py              # PPO智能体实现
 │   ├── config.py             # 配置管理
 │   ├── training_monitor.py   # 训练监控系统
@@ -55,9 +55,13 @@ robotic_arm_control/
 - **模型验证**: 检查模型配置和视觉支持能力
 
 ### 3. 强化学习抓取系统
-- **混合残差架构**: MoveIt 标称轨迹 + PPO 残差修正（v = v_nominal + Δv），UR5e+Robotiq 动态抓取/避障
+- **混合残差架构**: 自实现速度场标称层 + PPO 残差修正（v = v_nominal + Δv），UR5e+Robotiq 动态抓取/避障
+  （标称层为仿真速度场/运动学 MPC，**非 MoveIt**；MoveIt 仅出现在部署端设计中）
 - **消融验证**: 三路对比（端到端/残差/纯标称 × 3 场景，n=30）——静态 100%、动态目标 90%、
   动态+障碍 86.7%，残差全场景最优；对比图见 `rl_grasping_system/results/ablation_compare.png`
+- **MPC+RL（部分成功／进行中）**: 标称层升级为运动学 MPC（SLSQP 滚动），定位残差饱和根因 →
+  cap 解耦使高密度障碍平均碰撞 34×↓；但残差未在成功率上打赢纯 MPC、static3 未解——详见
+  `docs/简历项目知识整理.md` 与 `docs/数字真值表_20260910.md`
 - **独立模块**: 完全独立的抓取系统，不影响现有PID控制系统
 - **PPO算法**: 基于Stable-Baselines3的PPO实现
 - **归一化技术**: 观察归一化、奖励归一化、优势函数归一化
@@ -78,9 +82,9 @@ robotic_arm_control/
 - 详细的错误诊断和日志
 
 ### RL抓取系统
-- **环境**: MuJoCo + Panda机械臂
-- **算法**: PPO with 归一化
-- **任务**: 到达并抓取固定位置物体
+- **环境**: MuJoCo + UR5e + Robotiq 2F-85（速度级 IK + 夹爪接触状态机）
+- **算法**: PPO（Stable-Baselines3）+ VecNormalize 观测归一化
+- **任务**: 动态目标/动态障碍下的到达并抓取（残差架构）
 - **监控**: 实时训练监控和可视化
 - **部署**: 云端无头训练支持
 
@@ -119,12 +123,16 @@ python train_cloud.py
 - [x] UR5e机械臂PID控制系统
 - [x] VLM诊断系统完整实现
 - [x] 独立RL抓取系统架构
-- [x] 混合残差架构（MoveIt 标称 + PPO 残差）动态抓取/避障
+- [x] 混合残差架构（速度场标称 + PPO 残差）动态抓取/避障
 - [x] 三路消融对比实验（端到端 vs 残差 vs 纯标称）与对比图
 - [x] PPO智能体实现
 - [x] 归一化技术集成
 - [x] 云端训练支持
 - [x] 完整监控系统
+
+### 🔬 进行中（部分成功，主动标注）
+- [ ] MPC+RL 残差：标称层已升级运动学 MPC，cap 解耦带来碰撞 34×↓；**成功率未超越纯 MPC、static3 未解**
+- [ ] 感知噪声探测已完成（固定种子 n=50 配对，σ≤3cm / 漏检≤20% 下未观测到系统性下降，均不显著）；真机部署为后续阶段（MoveIt2 + 深度相机，设计已文档化）
 
 ### 🔧 技术改进
 - **PID控制**: 多种控制策略，详细参数调优
@@ -179,7 +187,7 @@ python train_cloud.py
 
 ### 现代AI技术
 - **强化学习**: PPO算法，Stable-Baselines3框架
-- **物理仿真**: MuJoCo引擎，Panda机械臂
+- **物理仿真**: MuJoCo引擎，UR5e + Robotiq 2F-85（仓库另有独立的 Panda PID 老目录）
 - **归一化**: 观察、奖励、优势函数归一化
 - **监控**: 实时训练监控，可视化图表
 
