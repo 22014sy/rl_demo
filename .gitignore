@@ -124,6 +124,21 @@ data/
 *.pkl
 # v24_mpcres VecNormalize 统计是模型部署必需（zip 同目录），放行入库
 !rl_grasping_system/models/final_model_stage2_d2_v24_mpcres_vecnormalize.pkl
+# 2026-09-10：简历数字对应的模型统计与评估结果 JSON 是证据，放行入库（仅限相关目录，避免历史草稿刷屏）
+!rl_grasping_system/models/final_model_stage2_d2_v18_p3f_vecnormalize.pkl
+!rl_grasping_system/models/final_model_stage2_d2_v11_500k_vecnormalize.pkl
+!rl_grasping_system/models/final_model_stage2_d2_v25b2_gate_vecnormalize.pkl
+!rl_grasping_system/models/final_model_stage2_d2_v26_delayrobust_vecnormalize.pkl
+!rl_grasping_system/results/ablation/*.json
+!rl_grasping_system/results/ablation_repro_20260910/*.json
+!rl_grasping_system/results/mpc_plus_rl/*.json
+!rl_grasping_system/results/mpc_plus_rl_v24/*.json
+!rl_grasping_system/results/mpc_plus_rl_v25b2/*.json
+!rl_grasping_system/results/perception/*.json
+!rl_grasping_system/results/perception_seeded/*.json
+!rl_grasping_system/results/delay_ab/*.json
+# 评估图/训练日志图：都可由对应 JSON 再生，不入库（否则 270+ 张历史 PNG 刷屏）
+rl_grasping_system/results/**/*.png
 # 训练脚本 CWD 在 models/ 下导致的重复输出目录（checkpoint 副本），不入库
 rl_grasping_system/models/models/
 *.h5

@@ -1,0 +1,257 @@
+{
+  "evaluation_time": "2026-08-28T23:15:20.757413",
+  "n_episodes": 30,
+  "success_rate": 0.9,
+  "avg_reward": 108.9760918089876,
+  "avg_episode_length": 89.73333333333333,
+  "avg_final_distance": 0.15115763681304625,
+  "avg_success_reward": 120.33179151129345,
+  "avg_success_length": 77.48148148148148,
+  "collision_rate": 0.0,
+  "collision_episodes": 0,
+  "avg_collision_count": 0.0,
+  "avg_residual_norm_success": 0.21639056822949018,
+  "avg_residual_norm_fail": 0.21636931136694285,
+  "episode_summaries": [
+    {
+      "episode_reward": 120.76616455884962,
+      "episode_length": 56,
+      "grasp_success": true,
+      "final_distance": 0.1477098840093281,
+      "collision_count": 0,
+      "avg_residual_norm": 0.21650634610681557
+    },
+    {
+      "episode_reward": 124.72534770328974,
+      "episode_length": 89,
+      "grasp_success": true,
+      "final_distance": 0.15223788855683704,
+      "collision_count": 0,
+      "avg_residual_norm": 0.2160687774514752
+    },
+    {
+      "episode_reward": 119.44568335953689,
+      "episode_length": 67,
+      "grasp_success": true,
+      "final_distance": 0.14892462034455858,
+      "collision_count": 0,
+      "avg_residual_norm": 0.21650634610681554
+    },
+    {
+      "episode_reward": 115.64203685520712,
+      "episode_length": 68,
+      "grasp_success": true,
+      "final_distance": 0.15029550292814292,
+      "collision_count": 0,
+      "avg_residual_norm": 0.21650634610681554
+    },
+    {
+      "episode_reward": 119.54788038464507,
+      "episode_length": 67,
+      "grasp_success": true,
+      "final_distance": 0.14892462034455858,
+      "collision_count": 0,
+      "avg_residual_norm": 0.21650634610681554
+    },
+    {
+      "episode_reward": 116.96715011586015,
+      "episode_length": 69,
+      "grasp_success": true,
+      "final_distance": 0.14562225265318063,
+      "collision_count": 0,
+      "avg_residual_norm": 0.21650634610681554
+    },
+    {
+      "episode_reward": 119.26042077346516,
+      "episode_length": 69,
+      "grasp_success": true,
+      "final_distance": 0.15057657004589786,
+      "collision_count": 0,
+      "avg_residual_norm": 0.21598199610890328
+    },
+    {
+      "episode_reward": 116.65387834167541,
+      "episode_length": 84,
+      "grasp_success": true,
+      "final_distance": 0.14777379162087265,
+      "collision_count": 0,
+      "avg_residual_norm": 0.21650634610681554
+    },
+    {
+      "episode_reward": 13.463916065641708,
+      "episode_length": 200,
+      "grasp_success": false,
+      "final_distance": 0.18063089882953592,
+      "collision_count": 0,
+      "avg_residual_norm": 0.21631964424720032
+    },
+    {
+      "episode_reward": -2.211482149601216,
+      "episode_length": 200,
+      "grasp_success": false,
+      "final_distance": 0.15178163928948193,
+      "collision_count": 0,
+      "avg_residual_norm": 0.21632818211512245
+    },
+    {
+      "episode_reward": 119.64039128402723,
+      "episode_length": 67,
+      "grasp_success": true,
+      "final_distance": 0.14892462034455858,
+      "collision_count": 0,
+      "avg_residual_norm": 0.21650634610681554
+    },
+    {
+      "episode_reward": 123.53711648796792,
+      "episode_length": 75,
+      "grasp_success": true,
+      "final_distance": 0.15118776828199743,
+      "collision_count": 0,
+      "avg_residual_norm": 0.21650634610681554
+    },
+    {
+      "episode_reward": 116.65572780517333,
+      "episode_length": 86,
+      "grasp_success": true,
+      "final_distance": 0.14697035730528887,
+      "collision_count": 0,
+      "avg_residual_norm": 0.21618410488093315
+    },
+    {
+      "episode_reward": 122.51050790507134,
+      "episode_length": 62,
+      "grasp_success": true,
+      "final_distance": 0.15968569096337912,
+      "collision_count": 0,
+      "avg_residual_norm": 0.21650634610681554
+    },
+    {
+      "episode_reward": 124.68094876411458,
+      "episode_length": 103,
+      "grasp_success": true,
+      "final_distance": 0.15357638967137868,
+      "collision_count": 0,
+      "avg_residual_norm": 0.21650634610681552
+    },
+    {
+      "episode_reward": 124.63037556839036,
+      "episode_length": 111,
+      "grasp_success": true,
+      "final_distance": 0.1513169316503483,
+      "collision_count": 0,
+      "avg_residual_norm": 0.21650634610681552
+    },
+    {
+      "episode_reward": 119.24999117055395,
+      "episode_length": 67,
+      "grasp_success": true,
+      "final_distance": 0.14892462034455858,
+      "collision_count": 0,
+      "avg_residual_norm": 0.21650634610681554
+    },
+    {
+      "episode_reward": 113.07303823656557,
+      "episode_length": 65,
+      "grasp_success": true,
+      "final_distance": 0.14966931166816544,
+      "collision_count": 0,
+      "avg_residual_norm": 0.21650634610681557
+    },
+    {
+      "episode_reward": 115.6181771374329,
+      "episode_length": 93,
+      "grasp_success": true,
+      "final_distance": 0.14786903070270743,
+      "collision_count": 0,
+      "avg_residual_norm": 0.21579214324702667
+    },
+    {
+      "episode_reward": 120.96081524656611,
+      "episode_length": 63,
+      "grasp_success": true,
+      "final_distance": 0.14919897612031044,
+      "collision_count": 0,
+      "avg_residual_norm": 0.21594355513449207
+    },
+    {
+      "episode_reward": 116.15891846366182,
+      "episode_length": 72,
+      "grasp_success": true,
+      "final_distance": 0.14618556510950403,
+      "collision_count": 0,
+      "avg_residual_norm": 0.21597172406829124
+    },
+    {
+      "episode_reward": 129.2543672837812,
+      "episode_length": 80,
+      "grasp_success": true,
+      "final_distance": 0.15249968007054557,
+      "collision_count": 0,
+      "avg_residual_norm": 0.21648534162240846
+    },
+    {
+      "episode_reward": 119.60309589938032,
+      "episode_length": 67,
+      "grasp_success": true,
+      "final_distance": 0.14892462034455858,
+      "collision_count": 0,
+      "avg_residual_norm": 0.21650634610681554
+    },
+    {
+      "episode_reward": 122.28117336864607,
+      "episode_length": 61,
+      "grasp_success": true,
+      "final_distance": 0.1516833438609417,
+      "collision_count": 0,
+      "avg_residual_norm": 0.21650634610681554
+    },
+    {
+      "episode_reward": 119.53386344280828,
+      "episode_length": 67,
+      "grasp_success": true,
+      "final_distance": 0.14892462034455858,
+      "collision_count": 0,
+      "avg_residual_norm": 0.21650634610681554
+    },
+    {
+      "episode_reward": 9.07194954866519,
+      "episode_length": 200,
+      "grasp_success": false,
+      "final_distance": 0.15529490444767352,
+      "collision_count": 0,
+      "avg_residual_norm": 0.21646010773850577
+    },
+    {
+      "episode_reward": 125.5201292646035,
+      "episode_length": 114,
+      "grasp_success": true,
+      "final_distance": 0.15281277342803967,
+      "collision_count": 0,
+      "avg_residual_norm": 0.21650634610681554
+    },
+    {
+      "episode_reward": 123.95020234610169,
+      "episode_length": 124,
+      "grasp_success": true,
+      "final_distance": 0.15266080382683905,
+      "collision_count": 0,
+      "avg_residual_norm": 0.21649712365320956
+    },
+    {
+      "episode_reward": 119.1214686022808,
+      "episode_length": 67,
+      "grasp_success": true,
+      "final_distance": 0.14892462034455858,
+      "collision_count": 0,
+      "avg_residual_norm": 0.21650634610681554
+    },
+    {
+      "episode_reward": 119.96950043526638,
+      "episode_length": 79,
+      "grasp_success": true,
+      "final_distance": 0.14501680693908076,
+      "collision_count": 0,
+      "avg_residual_norm": 0.21650634610681552
+    }
+  ]
+}

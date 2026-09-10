@@ -1,0 +1,43 @@
+{
+  "scene": "dyn_both",
+  "n_episodes": 3,
+  "success_rate": 0.6666666666666666,
+  "collision_rate": 0.3333333333333333,
+  "avg_collision_count": 5.666666666666667,
+  "avg_episode_length": 102.66666666666667,
+  "avg_residual_norm_success": 0.21650634610681554,
+  "avg_residual_norm_fail": 0.2161718522587538,
+  "max_residual_norm_overall": 0.2165063461068156,
+  "episode_results": [
+    {
+      "episode_length": 54,
+      "grasp_success": true,
+      "final_distance": 0.1535051814775823,
+      "collision_count": 0,
+      "avg_residual_norm": 0.21650634610681554,
+      "max_residual_norm": 0.2165063461068156,
+      "avg_mpc_solve_s": 0.09754776954650879,
+      "mpc_fallback": 0
+    },
+    {
+      "episode_length": 54,
+      "grasp_success": true,
+      "final_distance": 0.15727030755759341,
+      "collision_count": 0,
+      "avg_residual_norm": 0.21650634610681554,
+      "max_residual_norm": 0.2165063461068156,
+      "avg_mpc_solve_s": 0.09195733070373535,
+      "mpc_fallback": 0
+    },
+    {
+      "episode_length": 200,
+      "grasp_success": false,
+      "final_distance": 0.16088302272351257,
+      "collision_count": 17,
+      "avg_residual_norm": 0.2161718522587538,
+      "max_residual_norm": 0.2165063461068156,
+      "avg_mpc_solve_s": 0.047376394271850586,
+      "mpc_fallback": 0
+    }
+  ]
+}

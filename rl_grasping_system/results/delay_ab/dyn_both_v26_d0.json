@@ -1,0 +1,313 @@
+{
+  "scene": "dyn_both",
+  "n_episodes": 30,
+  "success_rate": 0.6333333333333333,
+  "collision_rate": 0.0,
+  "avg_collision_count": 0.0,
+  "avg_episode_length": 124.66666666666667,
+  "avg_residual_norm_success": 0.12401936808505482,
+  "avg_residual_norm_fail": 0.0998403018403173,
+  "max_residual_norm_overall": 0.17320508075688776,
+  "episode_results": [
+    {
+      "episode_length": 70,
+      "grasp_success": true,
+      "final_distance": 0.1480281768772564,
+      "collision_count": 0,
+      "avg_residual_norm": 0.12495509397461184,
+      "max_residual_norm": 0.17320508075688776,
+      "avg_mpc_solve_s": 0.07366371154785156,
+      "mpc_fallback": 0
+    },
+    {
+      "episode_length": 71,
+      "grasp_success": true,
+      "final_distance": 0.1515691919812429,
+      "collision_count": 0,
+      "avg_residual_norm": 0.12563467125323544,
+      "max_residual_norm": 0.17320508075688776,
+      "avg_mpc_solve_s": 0.07005882263183594,
+      "mpc_fallback": 0
+    },
+    {
+      "episode_length": 200,
+      "grasp_success": false,
+      "final_distance": 0.13556853613552983,
+      "collision_count": 0,
+      "avg_residual_norm": 0.10516715409952973,
+      "max_residual_norm": 0.17320508075688776,
+      "avg_mpc_solve_s": 0.041387081146240234,
+      "mpc_fallback": 0
+    },
+    {
+      "episode_length": 89,
+      "grasp_success": true,
+      "final_distance": 0.14787500589553426,
+      "collision_count": 0,
+      "avg_residual_norm": 0.14206708871070564,
+      "max_residual_norm": 0.17320508075688776,
+      "avg_mpc_solve_s": 0.08863353729248047,
+      "mpc_fallback": 0
+    },
+    {
+      "episode_length": 200,
+      "grasp_success": false,
+      "final_distance": 0.13696144983975284,
+      "collision_count": 0,
+      "avg_residual_norm": 0.1033808601821767,
+      "max_residual_norm": 0.17320508075688776,
+      "avg_mpc_solve_s": 0.05913043022155762,
+      "mpc_fallback": 0
+    },
+    {
+      "episode_length": 84,
+      "grasp_success": true,
+      "final_distance": 0.1507873338272159,
+      "collision_count": 0,
+      "avg_residual_norm": 0.12474889744990128,
+      "max_residual_norm": 0.17320508075688776,
+      "avg_mpc_solve_s": 0.07592368125915527,
+      "mpc_fallback": 0
+    },
+    {
+      "episode_length": 200,
+      "grasp_success": false,
+      "final_distance": 0.23242444474524343,
+      "collision_count": 0,
+      "avg_residual_norm": 0.09959292143521044,
+      "max_residual_norm": 0.17320508075688776,
+      "avg_mpc_solve_s": 0.10258245468139648,
+      "mpc_fallback": 0
+    },
+    {
+      "episode_length": 200,
+      "grasp_success": false,
+      "final_distance": 0.1330164469711185,
+      "collision_count": 0,
+      "avg_residual_norm": 0.10002593413710265,
+      "max_residual_norm": 0.17320508075688776,
+      "avg_mpc_solve_s": 0.04172801971435547,
+      "mpc_fallback": 0
+    },
+    {
+      "episode_length": 92,
+      "grasp_success": true,
+      "final_distance": 0.14718235021550952,
+      "collision_count": 0,
+      "avg_residual_norm": 0.12143182292194846,
+      "max_residual_norm": 0.17320508075688776,
+      "avg_mpc_solve_s": 0.07135295867919922,
+      "mpc_fallback": 0
+    },
+    {
+      "episode_length": 63,
+      "grasp_success": true,
+      "final_distance": 0.14774789848763414,
+      "collision_count": 0,
+      "avg_residual_norm": 0.12509255832441896,
+      "max_residual_norm": 0.17320508075688776,
+      "avg_mpc_solve_s": 0.07164263725280762,
+      "mpc_fallback": 0
+    },
+    {
+      "episode_length": 80,
+      "grasp_success": true,
+      "final_distance": 0.15166653713853911,
+      "collision_count": 0,
+      "avg_residual_norm": 0.12124355652982141,
+      "max_residual_norm": 0.17320508075688776,
+      "avg_mpc_solve_s": 0.07103967666625977,
+      "mpc_fallback": 0
+    },
+    {
+      "episode_length": 81,
+      "grasp_success": true,
+      "final_distance": 0.1542186645801931,
+      "collision_count": 0,
+      "avg_residual_norm": 0.13043839415024877,
+      "max_residual_norm": 0.17320508075688776,
+      "avg_mpc_solve_s": 0.06653404235839844,
+      "mpc_fallback": 0
+    },
+    {
+      "episode_length": 200,
+      "grasp_success": false,
+      "final_distance": 0.13351924719263525,
+      "collision_count": 0,
+      "avg_residual_norm": 0.09388839228452557,
+      "max_residual_norm": 0.17320508075688776,
+      "avg_mpc_solve_s": 0.04144906997680664,
+      "mpc_fallback": 0
+    },
+    {
+      "episode_length": 83,
+      "grasp_success": true,
+      "final_distance": 0.14629195015459706,
+      "collision_count": 0,
+      "avg_residual_norm": 0.13146891671908345,
+      "max_residual_norm": 0.17320508075688776,
+      "avg_mpc_solve_s": 0.06640410423278809,
+      "mpc_fallback": 0
+    },
+    {
+      "episode_length": 70,
+      "grasp_success": true,
+      "final_distance": 0.15042789683998023,
+      "collision_count": 0,
+      "avg_residual_norm": 0.12495509397461184,
+      "max_residual_norm": 0.17320508075688776,
+      "avg_mpc_solve_s": 0.08978390693664551,
+      "mpc_fallback": 0
+    },
+    {
+      "episode_length": 200,
+      "grasp_success": false,
+      "final_distance": 0.13222761668308042,
+      "collision_count": 0,
+      "avg_residual_norm": 0.10045025753209423,
+      "max_residual_norm": 0.17320508075688776,
+      "avg_mpc_solve_s": 0.03940939903259277,
+      "mpc_fallback": 0
+    },
+    {
+      "episode_length": 95,
+      "grasp_success": true,
+      "final_distance": 0.15005923486080486,
+      "collision_count": 0,
+      "avg_residual_norm": 0.11932730728112854,
+      "max_residual_norm": 0.17320508075688776,
+      "avg_mpc_solve_s": 0.0908820629119873,
+      "mpc_fallback": 0
+    },
+    {
+      "episode_length": 60,
+      "grasp_success": true,
+      "final_distance": 0.15239493637580714,
+      "collision_count": 0,
+      "avg_residual_norm": 0.11113992681900298,
+      "max_residual_norm": 0.17320508075688776,
+      "avg_mpc_solve_s": 0.07214641571044922,
+      "mpc_fallback": 0
+    },
+    {
+      "episode_length": 67,
+      "grasp_success": true,
+      "final_distance": 0.15110858306332992,
+      "collision_count": 0,
+      "avg_residual_norm": 0.12150207157572722,
+      "max_residual_norm": 0.17320508075688776,
+      "avg_mpc_solve_s": 0.08128547668457031,
+      "mpc_fallback": 0
+    },
+    {
+      "episode_length": 200,
+      "grasp_success": false,
+      "final_distance": 0.15708590750670276,
+      "collision_count": 0,
+      "avg_residual_norm": 0.10175798494467153,
+      "max_residual_norm": 0.17320508075688776,
+      "avg_mpc_solve_s": 0.07469844818115234,
+      "mpc_fallback": 0
+    },
+    {
+      "episode_length": 200,
+      "grasp_success": false,
+      "final_distance": 0.134013028183824,
+      "collision_count": 0,
+      "avg_residual_norm": 0.10126322914903929,
+      "max_residual_norm": 0.17320508075688776,
+      "avg_mpc_solve_s": 0.04044747352600098,
+      "mpc_fallback": 0
+    },
+    {
+      "episode_length": 200,
+      "grasp_success": false,
+      "final_distance": 0.13346510025830263,
+      "collision_count": 0,
+      "avg_residual_norm": 0.10002593413710265,
+      "max_residual_norm": 0.17320508075688776,
+      "avg_mpc_solve_s": 0.039255619049072266,
+      "mpc_fallback": 0
+    },
+    {
+      "episode_length": 83,
+      "grasp_success": true,
+      "final_distance": 0.14762224288495363,
+      "collision_count": 0,
+      "avg_residual_norm": 0.1252084921134128,
+      "max_residual_norm": 0.17320508075688776,
+      "avg_mpc_solve_s": 0.06287479400634766,
+      "mpc_fallback": 0
+    },
+    {
+      "episode_length": 70,
+      "grasp_success": true,
+      "final_distance": 0.14921917841107843,
+      "collision_count": 0,
+      "avg_residual_norm": 0.12866663141940227,
+      "max_residual_norm": 0.17320508075688776,
+      "avg_mpc_solve_s": 0.07183575630187988,
+      "mpc_fallback": 0
+    },
+    {
+      "episode_length": 67,
+      "grasp_success": true,
+      "final_distance": 0.1490799480024268,
+      "collision_count": 0,
+      "avg_residual_norm": 0.11762434588714019,
+      "max_residual_norm": 0.17320508075688776,
+      "avg_mpc_solve_s": 0.09251236915588379,
+      "mpc_fallback": 0
+    },
+    {
+      "episode_length": 200,
+      "grasp_success": false,
+      "final_distance": 0.1777086826048602,
+      "collision_count": 0,
+      "avg_residual_norm": 0.10002593413710265,
+      "max_residual_norm": 0.17320508075688776,
+      "avg_mpc_solve_s": 0.09173011779785156,
+      "mpc_fallback": 0
+    },
+    {
+      "episode_length": 77,
+      "grasp_success": true,
+      "final_distance": 0.14645052568378167,
+      "collision_count": 0,
+      "avg_residual_norm": 0.12371791482634835,
+      "max_residual_norm": 0.17320508075688776,
+      "avg_mpc_solve_s": 0.09582901000976562,
+      "mpc_fallback": 0
+    },
+    {
+      "episode_length": 159,
+      "grasp_success": true,
+      "final_distance": 0.14785913299946202,
+      "collision_count": 0,
+      "avg_residual_norm": 0.1165593939684716,
+      "max_residual_norm": 0.17320508075688776,
+      "avg_mpc_solve_s": 0.08025717735290527,
+      "mpc_fallback": 0
+    },
+    {
+      "episode_length": 79,
+      "grasp_success": true,
+      "final_distance": 0.15008813541086824,
+      "collision_count": 0,
+      "avg_residual_norm": 0.12058581571682055,
+      "max_residual_norm": 0.17320508075688776,
+      "avg_mpc_solve_s": 0.07068920135498047,
+      "mpc_fallback": 0
+    },
+    {
+      "episode_length": 200,
+      "grasp_success": false,
+      "final_distance": 0.1328783756219151,
+      "collision_count": 0,
+      "avg_residual_norm": 0.09266471820493492,
+      "max_residual_norm": 0.17320508075688776,
+      "avg_mpc_solve_s": 0.036559104919433594,
+      "mpc_fallback": 0
+    }
+  ]
+}
