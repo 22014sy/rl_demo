@@ -60,6 +60,19 @@ class MpcNominal:
         self.solver_ok = True
         self.min_obstacle_dist = float('inf')
         self.terminal_err = float('inf')
+        # arm-aware（2026-09-11）：臂身碰撞球软代价。默认关——关闭时 _arm_ctx=None，
+        # _predict 逐位等价于原单点模型（回归安全）。开启见 _build_arm_context。
+        self.arm_aware = bool(getattr(cfg, "mpc_nominal_arm_aware", False))
+        self.w_arm = float(getattr(cfg, "mpc_nominal_w_arm", 120.0))
+        self.arm_margin = float(getattr(cfg, "mpc_nominal_arm_margin", 0.05))
+        self.arm_lam = float(getattr(cfg, "mpc_nominal_arm_lam", 0.05))
+        self.arm_horizon = int(getattr(cfg, "mpc_nominal_arm_horizon", 5))
+        # 夹爪是 MESH/BOX，无解析半径 → 用 MuJoCo 编译出的包围球 geom_rbound 覆盖（保证包住，见
+        # _sample_geom_spheres）。实测 static3 的接触 100% 发生在夹爪 mesh 上、联杆 capsule 零接触，
+        # 故「只取 capsule/cylinder」的旧口径等于优化一个从不接触任何东西的部位（2026-09-11 修正）。
+        self.arm_pad = float(getattr(cfg, "mpc_nominal_arm_pad", 0.01))
+        self._arm_ctx = None                  # 每次 solve 重建（当前构型处的线性化）
+        self.arm_skip_cnt = 0                 # 奇异/不可用导致的跳过计数（诊断用）
         self.reset()
 
     def bind(self, model, data, arm_joint_ids, body_id):
@@ -90,6 +103,117 @@ class MpcNominal:
             vels.append(env._get_obstacle_velocity_by_id(_bid))
         return poses, vels
 
+    def _build_arm_context(self):
+        """构建臂身碰撞球的线性化上下文（每次 solve 一次；SLSQP 内层不重算）。
+
+        返回 None → _predict 完全不执行臂身项（退化为原单点模型）。
+
+        一阶模型必须与**执行层同口径**：action_wrapper 把 twist 积分成目标位姿后调
+        solve_ik（位置级 DLS、锁姿态），故用 6 行 DLS——`qdot = J₆ᵀ(J₆J₆ᵀ+λ²I)⁻¹·[v;0]`
+        （`J₆` = `rq_base_mount` body 雅可比取臂 dof 列，λ 同 ik.py）。用 3 行 pinv(J_ee)
+        会预测系统根本不产生的运动（nullspace 选择不一致）。
+        """
+        env = self._env
+        if env is None or not self.arm_aware:
+            return None
+        try:
+            import mujoco
+
+            model, data = env.model, env.data
+            ee_body = int(env.end_effector_id)
+            arm_dofs = np.asarray(
+                model.jnt_dofadr[np.asarray(env.arm_joint_ids, dtype=int)], dtype=int)
+            # 临时副本上前向：读 geom_xpos/xmat 与算雅可比都不动主 data（同 ik.py）
+            scratch = mujoco.MjData(model)
+            scratch.qpos[:] = data.qpos[:]
+            scratch.qvel[:] = data.qvel[:]
+            mujoco.mj_forward(model, scratch)
+
+            jacp = np.zeros((3, model.nv))
+            jacr = np.zeros((3, model.nv))
+            mujoco.mj_jacBody(model, scratch, jacp, jacr, ee_body)
+            J6 = np.vstack([jacp[:, arm_dofs], jacr[:, arm_dofs]])   # (6, 6)
+            if float(np.linalg.cond(J6)) > 1e3:
+                self.arm_skip_cnt += 1      # 近奇异：别让坏 pinv 注入垃圾
+                return None
+            A6 = J6 @ J6.T + (self.arm_lam ** 2) * np.eye(6)
+            M = J6.T @ np.linalg.solve(A6, np.eye(6))                # qdot = M @ [v; 0]
+
+            r_obs = float(getattr(self.cfg, 'obstacle_radius', 0.05))
+            pts, rads, jacs = [], [], []
+            for g in env._arm_obstacle_geoms():
+                if model.geom_contype[g] == 0:
+                    continue
+                for pt, r in self._sample_geom_spheres(model, scratch, int(g)):
+                    jp = np.zeros((3, model.nv))
+                    jr = np.zeros((3, model.nv))
+                    mujoco.mj_jac(model, scratch, jp, jr, pt, int(model.geom_bodyid[g]))
+                    pts.append(pt)
+                    rads.append(r)
+                    jacs.append(jp[:, arm_dofs])
+
+            if not pts:
+                return None
+            pos0 = np.asarray(pts, dtype=float)                    # (n, 3)
+            rad = np.asarray(rads, dtype=float)                    # (n,)
+            Js = np.asarray(jacs, dtype=float)                     # (n, 3, 6)
+            # 灵敏度：dp_s = (J_s @ M)[:, :3] @ u · dt = A_s @ u · dt
+            A_s = np.einsum('nij,jk->nik', Js, M)[:, :, :3]        # (n, 3, 3)
+            return dict(n=len(pts), pos0=pos0, rad=rad, A_s=A_s, r_obs=r_obs)
+        except Exception:
+            return None
+
+    def _sample_geom_spheres(self, model, scratch, g):
+        """把一个可碰撞 geom 覆盖成若干「世界系球心 + 半径」。
+
+        MESH/BOX 无解析半径语义 → 用 MuJoCo 编译出的**包围球** `geom_rbound`（按定义
+        = geom 局部原点到最远顶点的距离，故该球**必包住** geom；代价是偏保守，方向安全）。
+        CAPSULE/CYLINDER 用轴向采样（rbound 含半长，单球会严重过覆盖细长连杆）。
+        半径统一加 `arm_pad` 留量，补采样/线性化误差。
+        """
+        import mujoco
+        c = np.asarray(scratch.geom_xpos[g], dtype=float)
+        gt = int(model.geom_type[g])
+        pad = self.arm_pad
+        if gt == int(mujoco.mjtGeom.mjGEOM_CAPSULE):
+            axis = np.asarray(scratch.geom_xmat[g], dtype=float).reshape(3, 3)[:, 2]
+            r = float(model.geom_size[g][0])
+            half = float(model.geom_size[g][1])
+            k_n = int(max(2, np.ceil(2.0 * half / max(1.5 * r, 1e-6)))) + 1
+            return [(c + axis * (half * t), r + pad) for t in np.linspace(-1.0, 1.0, k_n)]
+        if gt == int(mujoco.mjtGeom.mjGEOM_CYLINDER):
+            axis = np.asarray(scratch.geom_xmat[g], dtype=float).reshape(3, 3)[:, 2]
+            r = float(model.geom_size[g][0])
+            half = float(model.geom_size[g][1])
+            k_n = int(max(2, np.ceil(2.0 * half / max(1.0 * r, 1e-6)))) + 1
+            return [(c + axis * (half * t), r + pad) for t in np.linspace(-1.0, 1.0, k_n)]
+        # MESH / BOX / SPHERE / ELLIPSOID：包围球（rad 由 geom_rbound 给出，必包住 geom）
+        r = float(model.geom_rbound[g])
+        if r <= 0.0:
+            return []
+        return [(c, r + pad)]
+
+    def _arm_cost(self, u, obs_list, ov_list):
+        """臂身-障碍表面距离 hinge 惩罚（按球数取均值，球数不改变量级）。"""
+        ctx = self._arm_ctx
+        if ctx is None or not obs_list:
+            return 0.0
+        A = ctx['A_s']
+        p = ctx['pos0'].copy()
+        rad = ctx['rad']
+        r_obs = ctx['r_obs']
+        margin = self.arm_margin
+        k_h = min(self.arm_horizon, self.N)
+        acc = 0.0
+        for k in range(k_h):
+            p = p + np.einsum('nij,j->ni', A, np.asarray(u[k], dtype=float)) * self.dt
+            for obs, ov in zip(obs_list, ov_list):
+                ok = obs + ov * (k + 1) * self.dt
+                d = np.linalg.norm(p - ok, axis=1) - rad - r_obs
+                viol = np.maximum(0.0, margin - d)
+                acc += float(np.dot(viol, viol))
+        return self.w_arm * acc / max(1, ctx['n'])
+
     def _predict(self, u, ee, hover, tv, obs_list, ov_list):
         """按决策序列回放预测路径，返回总成本（标量）。"""
         N, dt = self.N, self.dt
@@ -113,6 +237,9 @@ class MpcNominal:
         # 终端硬权重：末步强制到达（接近 hover 后 w_p 梯度→0，SLSQP 停住的根因）
         cost += self.w_term * float(np.dot(p - hover - tv * N * dt,
                                            p - hover - tv * N * dt))
+        # arm-aware：仅当上下文可用（关闭/奇异时为 None → 逐位等价原模型）
+        if self._arm_ctx is not None:
+            cost += self._arm_cost(u, obs_list, ov_list)
         return cost
 
 
@@ -142,6 +269,9 @@ class MpcNominal:
         obs_list, ov_list = self._read_obstacles()
         if obs_list is None:
             obs_list, ov_list = [], []
+
+        # arm-aware 上下文：当前构型处的一次线性化（关闭/不可用/奇异时为 None）
+        self._arm_ctx = self._build_arm_context()
 
         N = self.N
         vmax = self.v_max

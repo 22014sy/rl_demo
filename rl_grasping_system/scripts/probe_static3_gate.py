@@ -56,10 +56,16 @@ def main():
     ap.add_argument('--max-steps', type=int, default=200)
     ap.add_argument('--print-every', type=int, default=20)
     ap.add_argument('--seed', type=int, default=12345)
+    ap.add_argument('--arm-aware', action='store_true', help='arm-aware MPC（臂身碰撞球进代价）')
+    ap.add_argument('--w-arm', type=float, default=None, help='覆盖 mpc_nominal_w_arm')
     args = ap.parse_args()
 
     cfg = get_config()
-    configure_static3(cfg, args.max_steps)
+    g = configure_static3(cfg, args.max_steps)
+    if args.arm_aware:
+        g.mpc_nominal_arm_aware = True
+    if args.w_arm is not None:
+        g.mpc_nominal_w_arm = args.w_arm
     env = GraspingEnv(cfg.grasping, cfg.reward)
 
     log = []

@@ -235,6 +235,17 @@ class GraspingConfig:
     mpc_nominal_w_term: float = 800.0       # 终端硬权重（强制末步到位，破 warm-start 粘滞）
     mpc_nominal_xy_align_tol: float = 0.035 # XY 对准阈值：对准后才允许降 z（防 pad 侧撞推走 cube）
     mpc_nominal_approach_z: float = 0.06    # 未对准时目标悬高 (m)：先水平对准再下降（对标称两阶段语义）
+    # --- arm-aware MPC（2026-09-11）：把臂身碰撞球纳入标称层代价 ---
+    # 背景：mpc_nominal 原为单积分器、只建模末端一个点，对臂身失明——`D_SAFE` 放到 0.05 时
+    # 末端离障碍球心 0.13 m 仍发生 ~190 次臂身碰撞（见 docs/数字真值表_20260910.md §7）。
+    # 开启后：用**执行层同口径**的 6 行 DLS（qdot = J6ᵀ(J6J6ᵀ+λ²I)⁻¹·[v;0]，见 action_wrapper.solve_ik）
+    # 预算各连杆碰撞球的灵敏度，在 _predict 中对臂身-障碍表面距离加 hinge 惩罚。默认关（关闭即现状）。
+    mpc_nominal_arm_aware: bool = False     # 臂身碰撞感知总开关
+    mpc_nominal_w_arm: float = 120.0        # 臂身惩罚权重（按球数取均值口径，勿按单项求和）
+    mpc_nominal_arm_margin: float = 0.05    # 臂身表面安全留量 (m)
+    mpc_nominal_arm_lam: float = 0.05       # DLS 阻尼 λ（同 ik.py）
+    mpc_nominal_arm_horizon: int = 5
+    mpc_nominal_arm_pad: float = 0.01        # 臂身项生效步数（≤ horizon；冻结雅可比在时域末段外推失真）
 
     # --- D1 动态目标（L2 激活；L1 静止占位）---
     # 物体位置可 per-step 更新（运动学 qpos 写入，z 固定桌面高度 object_rest_z）

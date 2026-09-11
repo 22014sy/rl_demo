@@ -76,13 +76,19 @@ def main():
     ap.add_argument('--width', type=int, default=640)
     ap.add_argument('--height', type=int, default=480)
     ap.add_argument('--topdown', action='store_true')
+    ap.add_argument('--arm-aware', action='store_true', help='arm-aware MPC（臂身碰撞球进代价）')
+    ap.add_argument('--w-arm', type=float, default=None, help='覆盖 mpc_nominal_w_arm')
     ap.add_argument('--outdir', default='results/demo_static3')
     args = ap.parse_args()
 
     import mujoco
 
     cfg = get_config()
-    configure_static3(cfg, args.d_safe, args.max_steps)
+    g = configure_static3(cfg, args.d_safe, args.max_steps)
+    if args.arm_aware:
+        g.mpc_nominal_arm_aware = True
+    if args.w_arm is not None:
+        g.mpc_nominal_w_arm = args.w_arm
     env = GraspingEnv(cfg.grasping, cfg.reward)
 
     agent = None

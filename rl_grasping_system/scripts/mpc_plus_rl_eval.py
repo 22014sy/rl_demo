@@ -156,6 +156,10 @@ def main():
                          "验证实验：纯 MPC vs MPC+RL 谁对执行延迟更鲁棒")
     ap.add_argument("--seed", type=int, default=None,
                     help="固定环境随机源（障碍随机游走/场景采样）→ 跨模型 A/B 可复现；默认不固定")
+    ap.add_argument("--arm-aware", action="store_true",
+                    help="arm-aware MPC：标称层代价纳入臂身碰撞球（默认关；开启后臂身不再对障碍失明）")
+    ap.add_argument("--w-arm", type=float, default=None,
+                    help="覆盖 mpc_nominal_w_arm（臂身惩罚权重，默认 config 120.0）")
     ap.add_argument("--save-results", type=str, default="")
     args = ap.parse_args()
     sc = SCENE_CFG[args.scene]
@@ -174,6 +178,10 @@ def main():
         g.residual_delta_cap = args.residual_delta_cap   # v25：残差预算覆盖（默认 config 0.002）
     if args.d_safe is not None:
         g.mpc_nominal_d_safe = args.d_safe               # v25b2 验证：D_SAFE 覆盖
+    if args.arm_aware:
+        g.mpc_nominal_arm_aware = True                   # arm-aware MPC（臂身碰撞球进代价）
+    if args.w_arm is not None:
+        g.mpc_nominal_w_arm = args.w_arm                 # 臂身惩罚权重覆盖
     if args.ctrl_delay_steps is not None:
         g.ctrl_delay_steps = args.ctrl_delay_steps       # 模型失配：执行延迟扰动
 

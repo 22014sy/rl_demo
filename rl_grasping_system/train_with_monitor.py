@@ -134,6 +134,12 @@ def main():
                              '双障碍绕行需更多时间，200→250 可救超时失败；<0 用默认 200）')
     parser.add_argument('--obstacle-mix-ratio', type=float, default=-1.0,
                         help='D3 §11.4 无障碍混合采样比例（0~1；每 episode 该概率障碍隐藏做纯抓取训练；<0 用 config 默认 0）')
+    parser.add_argument('--arm-aware', action='store_true',
+                        help='arm-aware MPC：标称层代价纳入臂身碰撞球（默认关；开启后臂身不再对障碍失明）')
+    parser.add_argument('--w-arm', type=float, default=None,
+                        help='覆盖 mpc_nominal_w_arm（臂身惩罚权重，默认 config 120.0）')
+    parser.add_argument('--arm-horizon', type=int, default=None,
+                        help='覆盖 mpc_nominal_arm_horizon（臂身项生效步数，默认 5）')
     parser.add_argument('--scenario-mix', type=str, default='',
                         help='P3 训练分布（2026-08-27）：per-episode 场景采样 "静态无障,动态目标无障,动态目标+动态障碍"'
                              ' 概率（如 0.4,0.3,0.3；空=旧机制全跟随全局开关）。选中场景强制覆盖全局开关，'
@@ -233,6 +239,13 @@ def main():
             config.reward.residual_collision_threshold = args.residual_collision_threshold
         if args.residual_collision_penalty_extra is not None:
             config.reward.residual_collision_penalty_extra = args.residual_collision_penalty_extra
+        # arm-aware 标称层（臂身碰撞球进 MPC 代价）
+        if args.arm_aware:
+            config.grasping.mpc_nominal_arm_aware = True
+        if args.w_arm is not None:
+            config.grasping.mpc_nominal_w_arm = args.w_arm
+        if args.arm_horizon is not None:
+            config.grasping.mpc_nominal_arm_horizon = args.arm_horizon
         # v25b2 完整残差门控（关键帧触发 + 无解放大 + 最近点触发）
         if args.residual_gate_enabled:
             config.grasping.residual_gate_enabled = args.residual_gate_enabled.lower() == 'true'
