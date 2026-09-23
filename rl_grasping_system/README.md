@@ -58,7 +58,7 @@ python scripts/plot_ablation.py  # 生成 results/ablation_compare.png 对比图
 ## 系统特点
 
 ### 🎯 核心功能
-- **独立模块**: 完全独立的抓取系统，不影响现有VLM项目
+- **独立模块**: 环境 / 训练 / 评估自包含，外部依赖仅 MuJoCo 场景 `../models/universal_robots_ur5e/`
 - **PPO算法**: 基于Stable-Baselines3的PPO实现
 - **归一化技术**: 观察归一化、奖励归一化、优势函数归一化
 - **云端支持**: 无头渲染，适用于云端训练

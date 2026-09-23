@@ -1,227 +1,102 @@
-# 机器人强化学习项目
+# 机械臂抓取强化学习系统（混合残差架构）
 
-这是一个综合性的机器人控制系统项目，包含传统的PID轨迹跟踪控制和新兴的强化学习抓取系统。
+本仓库是一个面向**强化学习运动控制 / 具身智能方向实习**的作品集项目：让 UR5e + Robotiq 2F-85
+在 MuJoCo 仿真中完成**动态目标下的避障抓取**，采用**混合残差架构**——一个自实现的标称层给出
+解析参考轨迹，PPO 只学习对它的偏差修正（`v = v_nominal(t) + Δv`）。
 
-## 项目结构
+> ⚠️ 标称层是**本仓库自实现的仿真速度场 / 运动学 MPC**，**不是 MoveIt**。
+> MoveIt 只出现在部署端设计中（见 `docs/混合控制架构设计.md`、`docs/简历项目知识整理.md`）。
+
+## 设计动机：为什么不是端到端
+
+"到达并抓取"是长时序、多目标（接近 + 对齐 + 闭合 + 抬升 + 避障）的任务。端到端 PPO 让网络
+同时学"任务分解"和"控制偏差"，实测 8 版端到端训练均失败（归因见
+`rl_grasping_system/docs/2026-08-27_RL训练失败分析_v5到v12b.md`）。
+
+残差架构把任务拆开：**标称层负责"任务是什么"**（几何上正确的接近轨迹），
+**PPO 负责"差多少"**（局部偏差修正与避障绕行）。这样 RL 的学习目标更小、更局部，
+且标称层在域变化时仍然成立——这正是 sim2real 需要的性质。
+
+## 目录结构
 
 ```
 robotic_arm_control/
-├── panda/                      # Panda机械臂PID控制系统
-│   ├── pid_panda_simple.py     # 简化版PID控制系统
-│   ├── pid_panda_mujoco_motor.py # 双闭环PID控制系统
-│   ├── pid_panda_optimized.py  # 优化版PID控制系统
-│   ├── pid_control_comparison.py # PID控制对比分析
-│   └── PID_调参指南.md         # PID参数调优指南
-├── ur5e_control/               # UR5e机械臂控制系统
-│   ├── pid_trajectory_tracking.py # PID轨迹跟踪
-│   ├── ee_trajectory_dual_pid.py # 末端执行器双PID控制
-│   └── 机械臂初始与目标位置设置.md # 位置设置说明
-├── vlm_rl_framework/           # VLM诊断和测试框架
-│   ├── vlm_module/            # VLM处理模块
-│   ├── qwen_vl_test.py        # Qwen-VL-Chat测试脚本
-│   └── check_model.py         # 模型配置检查脚本
-├── rl_grasping_system/        # 独立的强化学习抓取系统
-│   ├── environment.py         # UR5e + Robotiq 2F-85 抓取环境
-│   ├── agent.py              # PPO智能体实现
-│   ├── config.py             # 配置管理
-│   ├── training_monitor.py   # 训练监控系统
-│   ├── vec_normalize_wrapper.py # 归一化包装器
-│   ├── train_cloud.py        # 云端训练脚本
-│   └── README.md             # 抓取系统详细文档
-├── models/                    # MuJoCo模型文件
-│   ├── franka_emika_panda/   # Panda机械臂模型
-│   └── universal_robots_ur5e/ # UR5e机械臂模型
-└── README.md                 # 本文件
+├── rl_grasping_system/          # 主系统：环境 / PPO 智能体 / 标称层 / 评估脚本
+│   ├── environment.py           # UR5e + Robotiq 2F-85 抓取环境（67 维观测 / 6 维残差动作）
+│   ├── reward.py                # 势能塑形奖励
+│   ├── mpc_nominal.py           # 第二代标称层：运动学 MPC（SLSQP 滚动）
+│   ├── agent.py                 # PPO 智能体封装 + 早停回调
+│   ├── scripts/                 # 消融 / MPC+RL / 感知噪声 / 延迟扰动等评估脚本
+│   ├── docs/                    # 开发日志、实验记录、学习笔记
+│   └── README.md                # 系统技术文档（观测/动作/奖励/配置详解）
+├── docs/                        # 简历与面试材料、数字口径总闸、架构设计
+└── models/universal_robots_ur5e/ # MuJoCo 场景（含 Robotiq 2F-85 与障碍物生成脚本）
 ```
 
-## 主要功能
+## 核心结果：三路消融
 
-### 1. 传统PID控制系统
+为验证"残差"这一设计选择本身是否有效，做了三路对比（端到端 PPO / 残差 PPO / 纯标称零残差），
+每场景 n=30、确定性评估，三路模型均在扩大后的桌面上**未重训**下评估：
 
-#### Panda机械臂PID控制
-- **简化版PID控制** (`pid_panda_simple.py`): 基于位置控制的PID轨迹跟踪
-- **双闭环PID控制** (`pid_panda_mujoco_motor.py`): 基于MuJoCo虚拟电机的双闭环控制
-- **优化版PID控制** (`pid_panda_optimized.py`): 优化的PID参数和控制策略
-- **控制对比分析** (`pid_control_comparison.py`): 不同PID控制方法的性能对比
-- **参数调优指南** (`PID_调参指南.md`): 详细的PID参数调优方法
+| 场景 | 端到端 PPO | 残差 PPO | 纯标称（零残差） |
+|---|---|---|---|
+| 静态无障 | 26.7% | **100%** | 83.3% |
+| 动态目标（0.05 m/s） | 63.3% | **90.0%** | 66.7% |
+| 动态目标 + 动态障碍 | 43.3% | **86.7%** | 70.0% |
 
-#### UR5e机械臂PID控制
-- **PID轨迹跟踪** (`pid_trajectory_tracking.py`): 基本的PID轨迹跟踪控制
-- **末端执行器双PID控制** (`ee_trajectory_dual_pid.py`): 末端执行器的双PID控制策略
+证据：`rl_grasping_system/results/ablation/summary_table.txt` + `results/ablation/*.json`，
+复现：`bash rl_grasping_system/scripts/run_ablation.sh`。
 
-### 2. VLM诊断系统
-- **Qwen-VL-Chat模型诊断**: 完整的视觉语言模型加载和推理测试
-- **问题定位**: 逐步诊断VLM加载、图像处理、推理过程中的问题
-- **模型验证**: 检查模型配置和视觉支持能力
+两点值得注意：静态任务纯标称已达 83.3%，说明**标称层解决了任务本身**，RL 补的是偏差；
+而端到端对域变化最敏感（静态跌到 26.7%）、残差最稳定，说明**学偏差比学任务更抗域偏移**。
 
-### 3. 强化学习抓取系统
-- **混合残差架构**: 自实现速度场标称层 + PPO 残差修正（v = v_nominal + Δv），UR5e+Robotiq 动态抓取/避障
-  （标称层为仿真速度场/运动学 MPC，**非 MoveIt**；MoveIt 仅出现在部署端设计中）
-- **消融验证**: 三路对比（端到端/残差/纯标称 × 3 场景，n=30）——静态 100%、动态目标 90%、
-  动态+障碍 86.7%，残差全场景最优；对比图见 `rl_grasping_system/results/ablation_compare.png`
-- **MPC+RL（部分成功／进行中）**: 标称层升级为运动学 MPC（SLSQP 滚动），定位残差饱和根因 →
-  cap 解耦使高密度障碍平均碰撞 34×↓；但残差未在成功率上打赢纯 MPC、static3 未解——详见
-  `docs/简历项目知识整理.md` 与 `docs/数字真值表_20260910.md`
-- **独立模块**: 完全独立的抓取系统，不影响现有PID控制系统
-- **PPO算法**: 基于Stable-Baselines3的PPO实现
-- **归一化技术**: 观察归一化、奖励归一化、优势函数归一化
-- **云端支持**: 无头渲染，适用于云端训练
-- **完整监控**: 训练进度、成功率、奇异点检测等
+## 第二代：MPC 标称层 + 残差（部分成功，主动标注）
 
-## 技术特点
+标称层由速度场升级为**运动学 MPC**（SLSQP 滚动最优控制）后，遇到一个反直觉现象：残差在
+成功率上**没有**打赢纯 MPC（动态+障碍 76.7% vs 90.0%），但在高密度障碍下大幅改善了安全性
+——碰撞 cap 解耦使 mixed3 平均碰撞从 40.03 降到 1.17（34×↓）。
 
-### 传统PID控制
-- **高精度轨迹跟踪**: 基于PID算法的精确轨迹控制
-- **多种控制策略**: 简化版、双闭环、优化版等多种实现
-- **参数调优**: 详细的调参指南和性能对比
-- **实时监控**: 完整的控制数据记录和分析
+诚实边界（完整口径见 `docs/数字真值表_20260910.md`、`docs/简历项目知识整理.md`）：
 
-### VLM系统
-- 支持Qwen-VL-Chat模型
-- 完整的图像预处理流程
-- 详细的错误诊断和日志
-
-### RL抓取系统
-- **环境**: MuJoCo + UR5e + Robotiq 2F-85（速度级 IK + 夹爪接触状态机）
-- **算法**: PPO（Stable-Baselines3）+ VecNormalize 观测归一化
-- **任务**: 动态目标/动态障碍下的到达并抓取（残差架构）
-- **监控**: 实时训练监控和可视化
-- **部署**: 云端无头训练支持
+- 残差**未在成功率上超越纯 MPC**——安全增益不等于成功率增益；
+- **static3 场景全版本 0%**：根因是只建模末端点的运动学 MPC 规划不出绕行，未解；
+- 早期评估脚本**无 seed 控制**，存在 ±8~17pp 采样噪声，故"高几个百分点"级结论不可信。
 
 ## 快速开始
 
-### 传统PID控制
-```bash
-# Panda机械臂PID控制
-cd panda
-python pid_panda_simple.py        # 简化版
-python pid_panda_mujoco_motor.py  # 双闭环版
-python pid_panda_optimized.py     # 优化版
-
-# UR5e机械臂PID控制
-cd ../ur5e_control
-python pid_trajectory_tracking.py
-python ee_trajectory_dual_pid.py
-```
-
-### VLM诊断
-```bash
-cd vlm_rl_framework
-python qwen_vl_test.py
-```
-
-### RL抓取训练
 ```bash
 cd rl_grasping_system
-python train_cloud.py
+pip install -r requirements.txt
+
+# 训练（本地带实时监控）
+python train_with_monitor.py
+
+# 评估某个模型
+python evaluate.py --model_path models/final_model_stage2_d2_v18_p3f.zip
+
+# 纯标称对照 / MPC 标称 / 执行延迟扰动
+python evaluate.py --model_path models/final_model_stage2_d2_v18_p3f.zip --zero-residual
+python scripts/mpc_plus_rl_eval.py --nominal-mode mpc --seed 0
 ```
 
-## 项目状态
+云端无头训练：`MUJOCO_GL=egl python train_cloud.py`。
 
-### ✅ 已完成
-- [x] Panda机械臂PID控制系统（多种实现）
-- [x] UR5e机械臂PID控制系统
-- [x] VLM诊断系统完整实现
-- [x] 独立RL抓取系统架构
-- [x] 混合残差架构（速度场标称 + PPO 残差）动态抓取/避障
-- [x] 三路消融对比实验（端到端 vs 残差 vs 纯标称）与对比图
-- [x] PPO智能体实现
-- [x] 归一化技术集成
-- [x] 云端训练支持
-- [x] 完整监控系统
+## 文档导航
 
-### 🔬 进行中（部分成功，主动标注）
-- [ ] MPC+RL 残差：标称层已升级运动学 MPC，cap 解耦带来碰撞 34×↓；**成功率未超越纯 MPC、static3 未解**
-- [ ] 感知噪声探测已完成（固定种子 n=50 配对，σ≤3cm / 漏检≤20% 下未观测到系统性下降，均不显著）；真机部署为后续阶段（MoveIt2 + 深度相机，设计已文档化）
+| 文档 | 用途 |
+|---|---|
+| [docs/简历项目知识整理.md](docs/简历项目知识整理.md) | **面试主手册**：知识点 → 对应文件 → 失败回顾 → 刁难问题 |
+| [docs/数字真值表_20260910.md](docs/数字真值表_20260910.md) | **数字口径总闸**：每个数字的证据文件与口径；已撤回数字清单 |
+| [docs/面试口述脚本_1页.md](docs/面试口述脚本_1页.md) | 一页口述脚本（开场三句 + 高频追问） |
+| [docs/混合控制架构设计.md](docs/混合控制架构设计.md) | 三层架构技术契约（标称 / 残差 / 实时安全层） |
+| [docs/ROADMAP.md](docs/ROADMAP.md) | 阶段路线图（L1 静态闭环 → L2 动态目标 → L3 动态演示） |
+| [rl_grasping_system/README.md](rl_grasping_system/README.md) | 系统技术文档：观测/动作空间、奖励设计、P2/P3/P4 演进 |
+| [rl_grasping_system/docs/](rl_grasping_system/docs/) | 开发日志、实验记录、调参失败分析、学习笔记 |
 
-### 🔧 技术改进
-- **PID控制**: 多种控制策略，详细参数调优
-- **归一化**: 观察/奖励归一化 + PPO内置优势函数归一化
-- **云端优化**: 无头渲染、CPU训练、错误处理
-- **监控增强**: 实时图表、早停机制、详细日志
+## 技术栈
 
-## 文件说明
-
-### 传统PID控制
-- `panda/`: Panda机械臂PID控制系统
-- `ur5e_control/`: UR5e机械臂PID控制系统
-- 详细文档请参考各目录下的README和指南文件
-
-### VLM相关
-- `vlm_rl_framework/`: VLM诊断和测试框架
-- `qwen_vl_test.py`: Qwen-VL-Chat专用测试
-- `check_model.py`: 模型配置检查
-
-### RL抓取系统
-- `rl_grasping_system/`: 完整的强化学习抓取系统
-- 详细文档请参考 `rl_grasping_system/README.md`
-
-## 依赖要求
-
-### 传统PID控制
-- mujoco
-- numpy
-- matplotlib
-- scipy
-
-### VLM系统
-- transformers
-- torch
-- PIL
-- numpy
-
-### RL抓取系统
-- stable-baselines3
-- mujoco
-- gymnasium
-- matplotlib
-- numpy
-
-## 技术栈总结
-
-### 传统控制技术
-- **PID算法**: 经典的比例-积分-微分控制
-- **轨迹规划**: 直线、圆弧、样条等多种轨迹
-- **实时控制**: 高频率的实时控制循环
-- **性能分析**: 控制精度、响应速度、稳定性分析
-
-### 现代AI技术
-- **强化学习**: PPO算法，Stable-Baselines3框架
-- **物理仿真**: MuJoCo引擎，UR5e + Robotiq 2F-85（仓库另有独立的 Panda PID 老目录）
-- **归一化**: 观察、奖励、优势函数归一化
-- **监控**: 实时训练监控，可视化图表
-
-### 部署技术
-- **云端部署**: 无头渲染，CPU优化
-- **错误处理**: 异常处理，日志记录
-- **配置管理**: 模块化配置，灵活参数
-- **文档系统**: 详细说明，使用指南
-
-## 项目价值
-
-### 1. 技术广度
-- **传统控制**: PID算法、轨迹规划、实时控制
-- **现代AI**: 强化学习、视觉语言模型、归一化技术
-- **工程实践**: 系统集成、云端部署、监控运维
-
-### 2. 实用价值
-- **工业应用**: 传统PID控制适用于实际机器人
-- **研究价值**: RL系统为机器人学习提供新思路
-- **教育意义**: 完整的控制系统学习平台
-
-### 3. 工程价值
-- **系统设计**: 模块化、可扩展的架构
-- **技术融合**: 传统控制与现代AI的结合
-- **部署能力**: 从本地到云端的完整部署方案
-
-## 贡献
-
-本项目展示了从传统PID控制到现代强化学习的完整技术栈，包括：
-1. 传统控制算法的实现和优化
-2. 现代AI技术的应用和集成
-3. 完整的工程实践和部署方案
-4. 详细的技术文档和使用指南
+MuJoCo · Gymnasium · Stable-Baselines3 (PPO) · SciPy (SLSQP) · NumPy · Matplotlib
 
 ## 许可证
 
-MIT License 
+MIT License
