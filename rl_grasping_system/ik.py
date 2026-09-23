@@ -16,6 +16,29 @@ import math  # 导入 Python 标准数学库，用于三角函数和平方根等
 # 在本函数中，`pinch` 是抓取/夹持点的 site，而 `rq_base_mount` 是末端安装底座的 body。
 FINGER_REACH = 0.1029  # 默认抓取点到指尖的长度，用于没有动态测量时的回退值。
 
+# --- IK 统计（Stage2 2026-09-19：评测要报「IK 失败数」）---
+# ⚠️ 口径边界（如实交代，勿外推为「所有 IK」）：执行期跟踪走 velocity_ik（逐帧雅可比伺服，
+# 没有「成功/失败」语义），本计数只覆盖调用 solve_ik 的地方——plan-time 目标点 IK、抬升段位姿
+# IK。另：solve_ik 本身不返回失败标志，故此处以「返回的位置误差 > tol」判定失败（与函数内的
+# 收敛判据同一阈值）。计数是进程级全局量，跨 episode 累加；评测器需按集取差分（见 eval）。
+IK_CALL_COUNT = 0   # solve_ik 调用次数
+IK_FAIL_COUNT = 0   # 其中返回位置误差 > tol 的次数
+
+
+def reset_ik_stats():
+    """清零 IK 统计（评测器在每集开始前调用，配合 ik_stats() 取差分）。"""
+    global IK_CALL_COUNT, IK_FAIL_COUNT
+    IK_CALL_COUNT = 0
+    IK_FAIL_COUNT = 0
+
+
+def ik_stats():
+    """返回 (调用次数, 失败次数, 失败率)；调用次数为 0 时失败率记 0.0。"""
+    calls = int(IK_CALL_COUNT)
+    fails = int(IK_FAIL_COUNT)
+    rate = (fails / calls) if calls > 0 else 0.0
+    return calls, fails, rate
+
 
 def finger_reach(model, data, pinch_site_name='pinch', base_body_name='rq_base_mount'):
     # 定义函数：动态测量 2F-85 指尖在末端根 body 相对距离。
@@ -211,7 +234,14 @@ def solve_ik(model, data, body_id, target_pos, target_quat, joint_ids,
 
     scratch.qpos[joint_ids] = best_q  # 将最优关节解写回 scratch。
     mujoco.mj_forward(model, scratch)  # 重新更新 scratch 的位姿，以便返回误差。
-    return best_q, float(np.linalg.norm(target_pos - scratch.xpos[body_id]))  # 返回最优关节角度和最终位置误差。
+    pos_err = float(np.linalg.norm(target_pos - scratch.xpos[body_id]))  # 最终位置误差。
+    # IK 统计：以「位置误差 > tol」判失败（与上面的收敛判据同一阈值）。solve_ik 无失败返回值，
+    # 这是唯一的失败信号；仅供评测上报，不影响求解结果。
+    global IK_CALL_COUNT, IK_FAIL_COUNT
+    IK_CALL_COUNT += 1
+    if pos_err > tol:
+        IK_FAIL_COUNT += 1
+    return best_q, pos_err  # 返回最优关节角度和最终位置误差。
 
 
 def move_to_q(env, arm_joints, q_target, n_steps):

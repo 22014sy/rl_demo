@@ -50,6 +50,7 @@ class MpcNominal:
         self._u_prev = None                   # warm start（上一步解）
         self._env = None                      # attach_env 后非 None → 启用障碍避障
         self.solve_time = 0.0
+        self.solve_time_total = 0.0           # 累加量：平均规划时间 = solve_time_total / solve_cnt
         self.fallback_cnt = 0
         self.solve_cnt = 0
         # v25b2 门控信号（每决策步 reference_velocity 更新）：solver_ok=SLSQP 求解成功（含无异常）；
@@ -243,7 +244,8 @@ class MpcNominal:
         return cost
 
 
-    def reference_velocity(self, ee_pos, target_pos, dt=None, target_vel=None) -> np.ndarray:
+    def reference_velocity(self, ee_pos, target_pos, dt=None, target_vel=None,
+                           hover_override=None) -> np.ndarray:
         """返回当前时刻标称参考速度 v_nominal（世界系 6 维 twist：[vx,vy,vz,0,0,0]）。
 
         Args:
@@ -251,6 +253,9 @@ class MpcNominal:
             target_pos: 当前（估计的）目标位置 (3,)
             dt: 决策周期 (s)；None 时用 0.04（action_repeat=2 × 50Hz 默认）
             target_vel: 目标速度 (3,)（动态目标 L2，z 分量不参与外推）
+            hover_override: 绕行路点（世界系 3 维）；非 None 时**直接用作 hover**，
+                跳过 `+hover_z_offset` 与 `xy_align` 抬 z——两阶段接近语义由调用方
+                （via_point_nominal）自行负责，内层不再插手。默认 None 时逐位等同原行为。
 
         Returns:
             np.ndarray (6,)：线速度前 3 维（m/s），角速度后 3 维恒 0
@@ -258,13 +263,16 @@ class MpcNominal:
         ee = np.asarray(ee_pos, dtype=float).ravel()[:3]
         tg = np.asarray(target_pos, dtype=float).ravel()[:3]
         self.dt = 0.04 if dt is None else float(dt)
-        hover = tg + np.array([0.0, 0.0, self.hover_z_offset])
         tv = np.zeros(3) if target_vel is None else np.asarray(target_vel, dtype=float).ravel()[:3]
         tv[2] = 0.0                      # 悬停高度不随目标外推
 
-        # 两阶段：XY 未对准 -> 目标 z 抬高（悬高接近，避免 pad 斜向侧撞 cube 推走）；对准后 -> hover
-        if float(np.linalg.norm(ee[:2] - hover[:2])) > self.xy_align_tol:
-            hover = np.array([hover[0], hover[1], hover[2] + self.approach_z])
+        if hover_override is None:
+            hover = tg + np.array([0.0, 0.0, self.hover_z_offset])
+            # 两阶段：XY 未对准 -> 目标 z 抬高（悬高接近，避免 pad 斜向侧撞 cube 推走）；对准后 -> hover
+            if float(np.linalg.norm(ee[:2] - hover[:2])) > self.xy_align_tol:
+                hover = np.array([hover[0], hover[1], hover[2] + self.approach_z])
+        else:
+            hover = np.asarray(hover_override, dtype=float).ravel()[:3]
 
         obs_list, ov_list = self._read_obstacles()
         if obs_list is None:
@@ -312,7 +320,11 @@ class MpcNominal:
         self.min_obstacle_dist = self._min_obstacle_dist_on_path(
             u_used, ee, hover, tv, obs_list, ov_list)
         self.terminal_err = self._terminal_err_on_path(u_used, ee, hover, tv)
-        self.solve_time = time.time() - t0
+        # ⚠️ solve_time 是**单次**耗时（赋值，不是累加）；评测要的「平均规划时间」必须用
+        # solve_time_total / solve_cnt，直接读 solve_time 会把最后一次的耗时当成全集均值。
+        _dt_solve = time.time() - t0
+        self.solve_time = _dt_solve
+        self.solve_time_total += _dt_solve
         self.solve_cnt += 1
 
         return np.concatenate([v, np.zeros(3)]).astype(np.float64)

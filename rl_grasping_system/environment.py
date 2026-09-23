@@ -331,10 +331,31 @@ class GraspingEnv(gym.Env):
         # 动作空间: 前7维=每步关节增量(rad)，第8维=肌腱命令(0=闭合,1=张开)（P1: 增量式位置控制）
         # P3: 动作空间 = 末端位姿增量（action_space_dim=6 -> 位置+姿态；3 -> 仅位置，姿态固定朝下）
         dim = int(self.grasping_config.action_space_dim)
-        lo = np.array([-self.grasping_config.max_ee_delta] * 3
-                      + [-self.grasping_config.max_orient_delta] * 3)[:dim]
-        hi = -lo.copy()
-        self.action_space = spaces.Box(low=lo.astype(np.float32), high=hi.astype(np.float32), dtype=np.float32)
+        # v27 动作空间归一化（2026-09-15）：residual 模式下声明 Box(-1,1)，env 内部再乘 _pos_cap 还原成米。
+        # ---- 为什么必须归一化（"残差恒满幅"的真正根因）----
+        # SB3 对 action_net 用 ortho(gain=0.01) 初始化，这个尺度隐含假设"动作是 O(1) 量级"
+        # （Box(-1,1) 归一化动作的通用约定）。而本环境的动作是**末端位置增量**，residual 的
+        # 有效量程只有 ±residual_delta_cap = ±0.002。旧写法把声明量程写成 ±max_ee_delta = ±0.005
+        # （跟真实量程无关），env 又用 np.clip(±0.002) 硬截断 —— 于是 |a|>0.002 的整个区域里
+        # ∂(执行动作)/∂a ≡ 0：策略看不到残差的**幅度**，只看到符号。
+        # 实测后果（读 v25b2_gate checkpoint 的 action_net 权重，N(0,1) 观测前向）：
+        #   μ 中位 3.37/3.66/2.35（初始仅 0.0034，涨了 ~1000×）、σ=1.67/1.80/1.01、
+        #   |μ|/σ 三轴恒 ≈2.0、P(|μ|>cap)=1.000 → 100% 饱和。
+        # 机理：env 只认符号 → 唯一可学方向是"让 sign(a) 稳定" → 需要 |μ|/σ 大；
+        #   而 ent_coef=0.01 在把 σ 往上推，所以只能靠 |μ| 上涨兑现 → μ、σ 各自随机游走到荒谬量级。
+        # 连带后果：reward 侧的 residual_l1_w / residual_step_w 因 ∂r/∂a=0 完全空转
+        #   （见 docs/2026-09-08_残差饱和分析与奖励重塑方案.md，那套稀疏惩罚在饱和区给不出梯度）。
+        # 归一化后：μ 的自然量级 O(1) 正好落在 [-1,1]，σ₀=1.0（SB3 默认）也终于是对的，
+        #   且策略工作点落在 (-1,1) 内部 → ∂Δ/∂a = _pos_cap ≠ 0 → 残差正则真正产生梯度。
+        # 注意 delta 模式不动：它的声明量程 ±max_ee_delta 与有效 cap 本来就是同一个值（1:1），语义自洽。
+        if (self.action_mode == 'residual'
+                and str(getattr(self.grasping_config, 'residual_clip_mode', 'modulus')) != 'per_axis'):
+            self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(dim,), dtype=np.float32)
+        else:
+            lo = np.array([-self.grasping_config.max_ee_delta] * 3
+                          + [-self.grasping_config.max_orient_delta] * 3)[:dim]
+            hi = -lo.copy()
+            self.action_space = spaces.Box(low=lo.astype(np.float32), high=hi.astype(np.float32), dtype=np.float32)
         
         # 观测空间（Task3：机械臂 6 关节 -> 55 维）：
         # 6关节位置+6关节速度+6关节力矩+1肌腱位置+1肌腱速度+1肌腱张力+
@@ -390,6 +411,15 @@ class GraspingEnv(gym.Env):
         # 感知噪声专用 RNG：与 np_random（障碍随机游走）隔离。否则加噪每步多消耗 4 个随机数，
         # 会把障碍序列整体推偏 → oracle 与加噪臂跑的不是同一条轨迹，配对对比失效。
         self._perc_rng = np.random.default_rng(seed if seed is not None else None)
+        # 恒偏置感知误差（config.perception_bias）：方向**每集抽一次**、集内恒定。
+        # 从 _perc_rng 抽（已按 seed 重播种）→ 同 seed 的 A/B 两臂偏置方向一致，配对成立。
+        # 只在开关打开时抽 → 关闭时 RNG 流不多消耗，与现状逐位一致。
+        self._perc_bias_vec = None
+        if float(getattr(self.grasping_config, 'perception_bias', 0.0)) > 0.0:
+            _bv = self._perc_rng.normal(0.0, 1.0, 3)
+            _bn = float(np.linalg.norm(_bv))
+            self._perc_bias_vec = ((_bv / _bn) if _bn > 1e-9 else np.zeros(3)) * float(
+                self.grasping_config.perception_bias)
         
         # 重置episode监控
         self.episode_start_time = time.time()
@@ -542,6 +572,11 @@ class GraspingEnv(gym.Env):
                 mujoco.mj_forward(self.model, self.data)
                 self.task_state['previous_joint_pos'] = joint_positions.copy()
 
+        # 臂位形至此才算定稿（上面可能刚把臂瞬移到 home）→ 复检 on-path 障碍间隙，
+        # 接触则沿路径法向外推清开。不加这一步会漏掉「先摆障碍、后瞬移臂」造成的初始穿透
+        # （2026-09-16：seed 12345+23，−2.4cm，四个 MPC 臂第 1 步各记 2 次碰撞）。
+        self._ensure_obstacle_clearance()
+
         # P1.3 势能塑形：prev_state 置为初始状态（而非 None），保证首步也按
         # Φ(s_prev) − γ·Φ(s) 的势能差计算，episode 回报望远镜式相消、有界
         self.prev_state = get_proprioceptive_state(self.data, self.model, self)
@@ -585,15 +620,35 @@ class GraspingEnv(gym.Env):
             # v25b2 双向解耦（2026-09-09）：MPC「到不了」（unstuck）时 clip 同步放大到
             # residual_gate_unstuck_cap（0.004→0.1m/s）——否则动作层先 clip 死、gate 放大无效
             # （static3 冒烟实证：res 恒 0.0866 = 常态 cap 满幅）。
-            _pos_cap = (float(getattr(self.grasping_config, 'residual_delta_cap', 0.002))
-                        if self.action_mode == 'residual' else self.grasping_config.max_ee_delta)
-            if self.action_mode == 'residual' and self._residual_unstuck():
+            # 2026-09-16：残差裁剪几何显式化（config.residual_clip_mode）。
+            # 'per_axis' = pre-gating 口径（cadd00e）：动作即米、逐轴裁 ±max_ee_delta。
+            # 该模式下不叠加 unstuck 放大（cadd00e 无门控，放大无对应语义）。
+            _clip_mode = str(getattr(self.grasping_config, 'residual_clip_mode', 'modulus'))
+            _res_per_axis = (self.action_mode == 'residual' and _clip_mode == 'per_axis')
+            _pos_cap = (self.grasping_config.max_ee_delta if _res_per_axis
+                        else (float(getattr(self.grasping_config, 'residual_delta_cap', 0.002))
+                              if self.action_mode == 'residual' else self.grasping_config.max_ee_delta))
+            if self.action_mode == 'residual' and not _res_per_axis and self._residual_unstuck():
                 _pos_cap = max(_pos_cap, float(getattr(self.grasping_config,
                                                        'residual_gate_unstuck_cap', 0.004)))
-            pos_delta = np.clip(a[:3], -_pos_cap, _pos_cap)
-            ori_delta = (np.clip(a[3:6], -self.grasping_config.max_orient_delta,
-                                 self.grasping_config.max_orient_delta)
-                         if dim >= 6 else np.zeros(3))
+            # v27：residual 模式下 a ∈ [-1,1] 是**归一化**动作，乘 _pos_cap 还原成米（推导见 _setup_spaces）。
+            # 这里的 clip 只用于兜底"越界"（|a|>1），不再是策略的常态工作点 —— 常态工作点在 (-1,1) 内部，
+            # 所以 ∂Δ/∂a = _pos_cap ≠ 0，residual_l1_w / residual_step_w 才终于给得出梯度。
+            if _res_per_axis:
+                # 逐轴裁剪（cadd00e 语义）：声明量程与实际量程都是 ±max_ee_delta，1:1
+                pos_delta = np.clip(a[:3], -_pos_cap, _pos_cap)
+                ori_delta = (np.clip(a[3:6], -self.grasping_config.max_orient_delta,
+                                     self.grasping_config.max_orient_delta)
+                             if dim >= 6 else np.zeros(3))
+            elif self.action_mode == 'residual':
+                pos_delta = np.clip(a[:3], -1.0, 1.0) * _pos_cap
+                ori_delta = (np.clip(a[3:6], -1.0, 1.0) * self.grasping_config.max_orient_delta
+                             if dim >= 6 else np.zeros(3))
+            else:
+                pos_delta = np.clip(a[:3], -_pos_cap, _pos_cap)
+                ori_delta = (np.clip(a[3:6], -self.grasping_config.max_orient_delta,
+                                     self.grasping_config.max_orient_delta)
+                             if dim >= 6 else np.zeros(3))
             T = self.substeps * max(1, self.action_repeat) * self.model.opt.timestep
             # Task3 抖动抑制 B：RL 动作一阶低通平滑（消除决策步跳变冲击；对应 MoveIt Servo smoothing_filter）
             _alpha = float(getattr(self.grasping_config, 'action_smoothing_alpha', 0.3))
@@ -601,13 +656,43 @@ class GraspingEnv(gym.Env):
             # D1 残差策略：v = v_nominal(t) + Δv/T（标称主导，RL 只学偏差）；
             # delta 模式保持旧语义 v = Δ/T，标称速度槽位置 0（观测预留）。
             if self.action_mode == 'residual' and self.nominal_trajectory is not None:
+                # 2026-09-16：标称层的目标来源。默认用真值 self.target_pos（现状，逐位不变）。
+                # perception_affects_nominal=True 时改用**策略当步实际看到的那份感知估计**：
+                # _get_observation() 在 reset 末尾与 step 末尾各抽一次噪声并存入 self._perceived_pos，
+                # 所以本行（step 中段）读到的正是策略选这个动作时的估计——语义对齐，且不额外消耗
+                # _perc_rng（多抽一次会把噪声序列推偏，A/B 配对失效）。噪声关闭时 _perceived_pos
+                # 恒为 None（_perceived_target_pos 提前返回），故本开关在无噪声下等价于关闭。
+                _tg_nominal = self.target_pos
+                if getattr(self.grasping_config, 'perception_affects_nominal', False):
+                    _perc = getattr(self, '_perceived_pos', None)
+                    if _perc is not None:
+                        _tg_nominal = np.asarray(_perc, dtype=float)
                 self._v_nominal = self.nominal_trajectory.reference_velocity(
-                    current_state['ee_position'], self.target_pos, T,
+                    current_state['ee_position'], _tg_nominal, T,
                     target_vel=getattr(self, '_dyn_target_vel', None))
                 v_raw = self._apply_residual_gate(self._v_nominal, _res_delta, T)
             else:
                 self._v_nominal = np.zeros(6)
                 v_raw = _res_delta
+            # 只读诊断钩子：平滑/限速/lift/closing 覆盖**之前**的原始命令。
+            # 残差 Δv = self._v_raw[:3] − self._v_nominal[:3]（用于 scripts/plot_residual_vs_nominal.py）。
+            self._v_raw = np.asarray(v_raw, dtype=float).copy()
+            # 姿态伺服（2026-09-15，config.orientation_servo_enabled）：见 config 同名开关注释——
+            # 速度模式下 `_vel_target[3:]` 恒 0（ori_delta≡0 且标称层角速度恒 0），姿态不受控，
+            # 接近轴倾角从 reset 原样保留到最后；而闭合判据看的是悬在 EE 轴下 0.146 m 的 pad 中点，
+            # 倾角 θ 把它水平推开 0.146·sinθ，θ>12° 即越过 grasp_align_xy_tol=0.03。
+            # 这里在**平滑之前**补上角速度通道（与位置通道同享低通，避免首帧 dq 阶跃的加速度前馈冲击）。
+            if getattr(self.grasping_config, 'orientation_servo_enabled', False):
+                _q_grasp = ik.quat_mul(
+                    np.asarray(current_state['target_orientation'], dtype=float), Q_APPROACH_DOWN)
+                _rot_err = ik.quat_vec(ik.quat_mul(
+                    _q_grasp, ik.quat_inv(np.asarray(current_state['ee_orientation'], dtype=float))))
+                _w = float(getattr(self.grasping_config, 'orientation_servo_gain', 4.0)) * _rot_err
+                _w_max = float(getattr(self.grasping_config, 'orientation_servo_max_rate', 0.5))
+                _w_norm = float(np.linalg.norm(_w))
+                if _w_norm > _w_max:
+                    _w = _w * (_w_max / _w_norm)
+                v_raw = np.concatenate([v_raw[:3], _w])
             self._v_smooth = _alpha * v_raw + (1.0 - _alpha) * self._v_smooth
             self._vel_target = self._v_smooth
             # Task3 冲击抑制 A：接近限速——pad 距 cube < approach_speed_dist 时限制末端线速度，防高速撞击弹飞。
@@ -1251,6 +1336,8 @@ class GraspingEnv(gym.Env):
         lat_dir = np.zeros(3)
         if n > 1e-6:
             lat_dir = np.array([-dxy[1] / n, dxy[0] / n, 0.0])
+        # 供 _ensure_obstacle_clearance 在臂位形定稿后沿同一法向外推（见该方法 docstring）
+        self._obstacle_lat_dir = lat_dir.copy()
         active = list(getattr(self, '_active_obstacle_body_ids', self.obstacle_body_ids[:1]))
         n_act = len(active)
         lrange = tuple(getattr(self.grasping_config, 'obstacle_path_lateral_range', (0.0, 0.0)))
@@ -1324,6 +1411,68 @@ class GraspingEnv(gym.Env):
             pos[2] = max(pos[2], table_top + r + 0.02)
             self._write_obstacle_pos(active[0], pos)
 
+    def _min_arm_obstacle_gap(self) -> float:
+        """臂（含夹爪）到任一障碍 geom 的**真实最小表面距**（m，负=穿透）。用 mj_geomDistance 精确算。
+
+        刻意不用 `_distance_arm_surface`（AABB 近似、忽略朝向，偏保守）当判据：健康集按其
+        真实间距只有 +0.011~+0.062（中位 +0.041），任何绝对余量阈值都会误伤多集。
+        """
+        if not self.obstacle_geom_ids_all:
+            return float('inf')
+        arm = self._arm_obstacle_geoms()
+        best = float('inf')
+        for g_obs in self.obstacle_geom_ids_all:
+            for g_arm in arm:
+                d = mujoco.mj_geomDistance(self.model, self.data, g_obs, g_arm, 1.0, np.zeros(6))
+                if d < best:
+                    best = float(d)
+        return best
+
+    def _ensure_obstacle_clearance(self, target_gap: float = 0.05) -> None:
+        """臂位形定稿后复检 on-path 障碍是否戳着臂；戳着则把整面障碍墙沿路径法向外推。
+
+        必要性（2026-09-16 实测）：`_place_obstacles_on_path` 的候选布局只对**放置时**的臂位形
+        做过接触检查，而 reset 里紧随其后的「Task3 防初始碰撞」分支可能把臂瞬移到 safe_config
+        （seed 12345+23：pad_z 0.296 < 阈值 0.31 → 瞬移）。瞬移之后无人复检，障碍0 变成
+        −2.4cm 初始穿透 → episode 第 1 步即记臂身碰撞，四个 MPC 臂全中且都抓取成功，与策略
+        完全无关，直接污染「零臂身碰撞」指标。
+
+        **触发条件刻意收窄为「臂在球内」（contact）**，而非「余量不足」：30 集里只有第 23 集
+        的间距是负的（−0.0243），健康集是 +0.011~+0.062。用绝对余量阈值会误伤约 10 集，
+        把墙整体推离路径、改变场景难度。收窄后爆炸半径严格 = 那个坏集。
+
+        **修到 target_gap 而非「刚好不接触」**：该集初始位形是被瞬移过去的，臂一动就朝球走，
+        只推到 gap≈+0.017 时第 1 步照样撞（实测）；推到 +0.05 量级（≈健康集中位）才稳。
+
+        外推而非抬 z：抬 z 要让该球升到 0.67 才脱开（球会飘到夹爪穿越带之上，那一集就不再
+        "挡路"）；沿法向外推是 `_place_obstacles_on_path` 里 wall ∈ ±[0.03,0.21] 的同一操作
+        （整面墙一起动，保持墙形）。代价：该集障碍离路径比正常集远约 0.1m（如实记录，见
+        results/unified7_trainmatch_fix/）。
+        """
+        if not getattr(self, '_obstacle_active', False):
+            return
+        if not bool(getattr(self.grasping_config, 'obstacle_on_nominal_path', False)):
+            return
+        active = list(getattr(self, '_active_obstacle_body_ids', None) or [])
+        lat = getattr(self, '_obstacle_lat_dir', None)
+        if not active or lat is None or float(np.linalg.norm(lat)) < 1e-9:
+            return
+        if not self._check_arm_obstacle_contact():
+            return
+        base = {_bid: self.data.xpos[_bid].copy() for _bid in active}
+        step = 0.02
+        for sign in (1.0, -1.0):
+            for k in range(1, 21):                       # 最远外推 0.40m
+                for _bid in active:
+                    self._write_obstacle_pos(_bid, base[_bid] + lat * (sign * step * k))
+                mujoco.mj_forward(self.model, self.data)
+                if not self._check_arm_obstacle_contact() and self._min_arm_obstacle_gap() >= target_gap:
+                    return
+        for _bid in active:  # 两侧外推到底仍不达标（不应发生）：还原原摆放并告警
+            self._write_obstacle_pos(_bid, base[_bid])
+        mujoco.mj_forward(self.model, self.data)
+        self.logger.warning(f"on-path 障碍外推 0.40m 仍未达 {target_gap:.2f}m 间距，保持原摆放")
+
     def _get_obstacle_distance(self) -> float:
         """D2: 夹爪/机械臂最近碰撞体（contype>0 的 geom）到障碍表面的距离(m)。
 
@@ -1364,6 +1513,22 @@ class GraspingEnv(gym.Env):
         unstuck_term = float(getattr(gcfg, 'residual_gate_unstuck_terminal_err', 0.10))
         return (not bool(nt.solver_ok)) or (float(nt.terminal_err) > unstuck_term)
 
+    def _clip_residual_speed(self, residual_v: np.ndarray, cap_v: float) -> None:
+        """按 `residual_clip_mode` 裁剪残差**线速度**（原地，只动前 3 维）。
+
+        - 'modulus'（默认/v25+）：按模长缩放到 cap_v —— 现状，逐位等价。
+        - 'per_axis'（pre-gating/cadd00e）：逐轴裁到 ±cap_v —— 与动作层的逐轴裁剪同几何。
+        两处调用点（门控开/关分支）共用，避免几何不一致。
+        """
+        if cap_v <= 0.0:
+            return
+        if str(getattr(self.grasping_config, 'residual_clip_mode', 'modulus')) == 'per_axis':
+            np.clip(residual_v[:3], -cap_v, cap_v, out=residual_v[:3])
+        else:
+            _sp = float(np.linalg.norm(residual_v[:3]))
+            if _sp > cap_v:
+                residual_v[:3] *= cap_v / _sp
+
     def _apply_residual_gate(self, nominal_v: np.ndarray, residual_v: np.ndarray, dt: float) -> np.ndarray:
         """v25b2 关键帧触发残差门控：Δv 只在「关键帧」开放预算，其余时刻 gate=0。
 
@@ -1387,7 +1552,12 @@ class GraspingEnv(gym.Env):
             return nominal_v + residual_v
 
         gate_enabled = bool(getattr(gcfg, 'residual_gate_enabled', False))
-        residual_cap = float(getattr(gcfg, 'residual_delta_cap', 0.002)) / max(float(dt), 1e-6)
+        # 2026-09-16：cap 的**取值来源**随裁剪几何切换——per_axis 用 max_ee_delta（cadd00e 语义），
+        # modulus 用 residual_delta_cap（v25+ 语义）。两者都是"每决策步位移上限"，量纲一致。
+        _cap_m = (float(getattr(gcfg, 'max_ee_delta', 0.005))
+                  if str(getattr(gcfg, 'residual_clip_mode', 'modulus')) == 'per_axis'
+                  else float(getattr(gcfg, 'residual_delta_cap', 0.002)))
+        residual_cap = _cap_m / max(float(dt), 1e-6)
 
         # ---- v25b2 关键帧门控 ----
         if gate_enabled:
@@ -1416,9 +1586,7 @@ class GraspingEnv(gym.Env):
                 ) < safety_margin
 
             # 残差速度 cap（常态或 unstuck 放大后）
-            residual_speed = float(np.linalg.norm(residual_v[:3]))
-            if residual_speed > residual_cap > 0.0:
-                residual_v[:3] *= residual_cap / residual_speed
+            self._clip_residual_speed(residual_v, residual_cap)
 
             if near and not unstuck:
                 # 正常预算下的接近避障：切平面投影 + 近距清零（v25b1 语义保留）
@@ -1450,9 +1618,7 @@ class GraspingEnv(gym.Env):
                 residual_v *= 0.0
         else:
             # ---- v25b1 基础版行为（residual_gate_enabled=False 兼容回退）----
-            residual_speed = float(np.linalg.norm(residual_v[:3]))
-            if residual_speed > residual_cap > 0.0:
-                residual_v[:3] *= residual_cap / residual_speed
+            self._clip_residual_speed(residual_v, residual_cap)
             ee_pos = np.asarray(self._get_end_effector_position(), dtype=float)
             obs_positions = self._get_obstacle_positions()
             if obs_positions:
@@ -1657,24 +1823,31 @@ class GraspingEnv(gym.Env):
         """D6 感知噪声：目标位置的感知估计（仅观测通道）。
 
         物理真值（self.target_pos，自由关节承载）+ 高斯噪声（模拟相机深度反投影误差）
-        + 随机漏检（YOLO/tracker 丢帧 → 零阶保持上次估计）。奖励/物理位置仍用真值
-        （感知-控制双通道隔离，隔离变量：只换观测，量化策略感知容忍度）。
+        + 随机漏检（YOLO/tracker 丢帧 → 零阶保持上次估计）+ 恒偏置（标定/mask 系统性偏差）。
+        奖励/物理位置仍用真值（感知-控制双通道隔离，隔离变量：只换观测，量化策略感知容忍度）。
+        恒偏置的方向每集抽一次、集内恒定（见 reset）；白噪声每步重抽 —— 两者测的是不同时间
+        结构的误差：白噪声会被闭环每步重瞄准平均掉，恒偏不会，所以只有恒偏能测出"送错位置"。
         """
         std = float(getattr(self.grasping_config, 'perception_noise_std', 0.0))
         dropout = float(getattr(self.grasping_config, 'perception_dropout', 0.0))
+        bias = getattr(self, '_perc_bias_vec', None)
         true = self.target_pos.copy()
-        if std <= 0.0 and dropout <= 0.0:
+        if std <= 0.0 and dropout <= 0.0 and bias is None:
             return true
         rng = getattr(self, '_perc_rng', None)
         if rng is None:                      # 未走 reset 的兜底路径
             rng = self.np_random
+        # 恒偏置加在**真值**上（不是加在估计上）：否则零阶保持那一路会把上一步已含偏置的
+        # 估计再加一次偏置 → 漏检时偏置会逐帧累积。bias=None 时 src 就是 true 本身，
+        # 下面两行与改动前逐位等价。
+        src = true if bias is None else true + bias
         if self._perceived_pos is None:
             # 首次（reset 后）：以当前真值+噪声为初始估计，避免初始化偏差
-            est = true + rng.normal(0.0, std, 3) if std > 0.0 else true.copy()
+            est = src + rng.normal(0.0, std, 3) if std > 0.0 else src.copy()
         else:
             est = self._perceived_pos.copy()  # 默认零阶保持（漏检语义）
             if float(rng.uniform()) >= dropout:
-                est = true + rng.normal(0.0, std, 3)  # 正常检测：真值+噪声
+                est = src + rng.normal(0.0, std, 3)  # 正常检测：真值+噪声
         self._perceived_pos = est.copy()
         return est.copy()
 
@@ -1686,7 +1859,8 @@ class GraspingEnv(gym.Env):
         # D6 感知噪声：仅污染观测通道的 target_position（感知-控制双通道隔离——
         # 奖励/物理位置仍读 self.target_pos 真值，见 state.py:125 与 step 内奖励计算）
         if (float(getattr(self.grasping_config, 'perception_noise_std', 0.0)) > 0.0
-                or float(getattr(self.grasping_config, 'perception_dropout', 0.0)) > 0.0):
+                or float(getattr(self.grasping_config, 'perception_dropout', 0.0)) > 0.0
+                or getattr(self, '_perc_bias_vec', None) is not None):
             state['target_position'] = self._perceived_target_pos()
 
         # P2-2: 相对接近姿态四元数 —— 从当前手姿态转到目标抓取姿态的旋转（在手坐标系表达）。

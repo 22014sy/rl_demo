@@ -4,7 +4,7 @@
 
 import os
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 @dataclass
 class GraspingConfig:
@@ -56,6 +56,17 @@ class GraspingConfig:
     #   残差只能是"微调"（0.5s 内 ~2.5cm 修正量），不能"覆盖"MPC 刚算出的安全速度方向；
     #   delta 模式不受影响（仍用 max_ee_delta）。v24 恒 0.2165 的饱和根因即 clip 上界与此处同级。
     residual_delta_cap: float = 0.002
+    # 残差裁剪几何（2026-09-16 新增，把"口径"从 commit 属性变成显式开关）：
+    #   'modulus'  = 现状（HEAD/v25+ 语义）：动作层 a∈[-1,1]×cap，再对 ‖Δv‖ 做**模长**裁剪
+    #                → cap=0.002 时 v_max=0.05 m/s。默认，逐位等价于改动前。
+    #   'per_axis' = pre-gating 口径（`cadd00e` 语义）：逐轴 clip(±max_ee_delta)，
+    #                → 单轴 0.005，模长上限 √3×0.005/T = 0.2165 m/s。
+    # 存在理由：v18_p3f / v11 等 **pre-gating 模型**训练时用的是 per_axis 几何，
+    # 在 HEAD 默认模长口径下其残差预算被压到约 23%（§6）。此前没有任何开关能还原，
+    # 导致这些模型只能钉在 cadd00e 上评、无法与 v25+ 放进同一张表。
+    # 本开关让「每个模型按自己训练时的几何评估」成为一次性可配的事实，而不是跨 commit 的巧合。
+    # ⚠️ 只影响 residual 模式；delta 模式不受影响。
+    residual_clip_mode: str = "modulus"
     # v25b2 完整残差门控（2026-09-09，docs/2026-09-08 §13；关键帧触发 + 无解放大 + 最近点触发）：
     #   residual_gate_enabled=True   关键帧门控总开关。True=Δv 仅在关键帧开放预算、常态 gate=0
     #                                （治饱和/简单场景回退）；False=回退 v25b1 基础版行为（恒允许 cap 内残差）。
@@ -72,6 +83,18 @@ class GraspingConfig:
     residual_gate_unstuck_terminal_err: float = 0.10
     max_orient_delta: float = 0.05  # 每步姿态增量上限 (rad，旋转向量模长上限；角速度 1.25rad/s)
     ik_error_hold: float = 0.02     # IK 位置误差超过该值(m)时保持当前位置（不朝不可达目标乱动）
+    # --- 姿态伺服（2026-09-15）：补上速度模式缺失的角速度通道 ---
+    # 背景：速度模式下 ori_delta ≡ 0（action_space_dim=3），而两个标称层都返回 [v, 0,0,0]
+    #   → `_vel_target[3:]` 恒 0 → `velocity_ik` 被命令的末端角速度恒为 0，**姿态是完全不受控的
+    #   自由度**。实测（static, n=30, MPC 标称）：末端接近轴倾角从 reset 起原样保留到最后
+    #   （corr(t=0, t=末)=0.9896，成功集漂移 −0.01°）；而 pad 中点悬在 EE 轴下方 0.146 m，
+    #   倾角 θ 把它水平推开 0.146·sinθ（corr(倾角, pad偏移)=0.9952）；θ>12° 即越过
+    #   grasp_align_xy_tol=0.03 → 静态场景 4/30 失败全部源于此，与 MPC 控制质量无关。
+    # 开启后：ω = clamp(k·rotvec(q_grasp ⊗ q_ee⁻¹), ω_max)，对标 moveit_servo 跟踪完整 6 维位姿。
+    # 默认关（关闭即现状，旧数字逐位可复现）。
+    orientation_servo_enabled: bool = False
+    orientation_servo_gain: float = 4.0      # 比例增益 (1/s)
+    orientation_servo_max_rate: float = 0.5  # 角速度上限 (rad/s)
     # Task3: 速度级 IK 阻尼系数（雅可比阻尼伪逆 dq=(JᵀJ+λ²I)⁻¹Jᵀv；越大越稳但末端速度实现率越低）
     # B+D 方案（见 docs/奇异点处理方案讨论记录.md）：0.05→0.08，奇异邻域数值更稳（类实机奇异降速）
     velocity_ik_lam: float = 0.08
@@ -184,6 +207,27 @@ class GraspingConfig:
     # 对应部署侧 RealSense 深度反投影误差（~0.01-0.02m）+ YOLO 漏检（tracker 丢帧零阶保持）。
     perception_noise_std: float = 0.0  # 目标位置高斯噪声标准差 (m)；0=关闭
     perception_dropout: float = 0.0    # 随机漏检概率 (0~1)；0=关闭；漏检时目标估计保持上次值
+    # 2026-09-16：把感知误差从"只坑策略"升级为"坑整条控制链"——标称层也吃同一份带噪估计。
+    # 动机：默认(False)时标称层读 self.target_pos 真值，噪声只污染策略观测 → 实验测的是"策略被
+    #   喂垃圾时掉多少分"，而不是"感知误差经控制器传播后能不能被残差补回来"。且旧 D6 口径下
+    #   出现过"加噪反而 +16.7pp"（docs/2026-08-28_D6感知噪声鲁棒性实验.md §2.1），而标称是 oracle，
+    #   噪声不可能因果地提升性能 → 那是 n=30 的波动带（同文档 §4 记 oracle 两次重跑差 13.4pp）。
+    # True 时：标称层 reference_velocity 收到的是**策略当步实际看到的那份感知估计**
+    #   （self._perceived_pos，由上一步 _get_observation 抽出的那次噪声；不额外耗 RNG，配对不破坏）。
+    # 默认 False = 现状，逐位不变。
+    perception_affects_nominal: bool = False
+
+    # 2026-09-16：**恒偏置**感知误差（m）。与 perception_noise_std 的区别是"误差的时间结构"：
+    #   noise_std 每步重抽、均值为零 → 闭环 P 控制器每步重新瞄准，130 步的抖动自己平均掉，
+    #     再加 α=0.7 低通 → 实测 σ=0.04（4cm，比立方体半宽 2cm 还大）也打不动成功率
+    #     （results/perception_sweep/，三臂在 σ∈{0,0.02,0.04} 上非单调）。
+    #   bias 是**每集抽一次方向、集内恒定**的偏移（单位向量 × 本值），模拟真实感知误差：
+    #     标定偏了 / 分割 mask 系统性外扩 → 目标估计恒定偏几厘米。恒偏**不会**被平均掉，
+    #     它直接把末端送错位置；而抓取容差 grasp_align_xy_tol=0.03、立方体半宽 0.02
+    #     → 偏 2~3cm 就该掉。这才是"感知误差"该测的那种。
+    # 方向从 _perc_rng 抽（reset 里按 seed 重播种）→ 同 seed 的 A/B 两臂偏置方向一致，配对成立。
+    # 默认 0.0 = 关闭，且为 0 时**不抽方向**、_perceived_target_pos 提前返回真值 → 逐位不变。
+    perception_bias: float = 0.0
 
     # ============================================================
     # D1（2026-08-24，一周冲刺方案 §5）残差策略 + 动态化环境地基
@@ -242,10 +286,41 @@ class GraspingConfig:
     # 预算各连杆碰撞球的灵敏度，在 _predict 中对臂身-障碍表面距离加 hinge 惩罚。默认关（关闭即现状）。
     mpc_nominal_arm_aware: bool = False     # 臂身碰撞感知总开关
     mpc_nominal_w_arm: float = 120.0        # 臂身惩罚权重（按球数取均值口径，勿按单项求和）
-    mpc_nominal_arm_margin: float = 0.05    # 臂身表面安全留量 (m)
+    mpc_nominal_arm_margin: float = 0.05    # 臂身表面**目标**留量 (m)：d < 此值才罚，是「要求臂身离障碍多远」
     mpc_nominal_arm_lam: float = 0.05       # DLS 阻尼 λ（同 ik.py）
-    mpc_nominal_arm_horizon: int = 5
-    mpc_nominal_arm_pad: float = 0.01        # 臂身项生效步数（≤ horizon；冻结雅可比在时域末段外推失真）
+    mpc_nominal_arm_horizon: int = 5        # 臂身项生效步数（≤ horizon；冻结雅可比在时域末段外推失真）
+    # ⚠️ 注释修正 2026-09-20：原写「臂身项生效步数」是错的（那是 arm_horizon 的说明，被复制串了）。
+    # arm_pad 实际是**加到每个臂身碰撞球半径上的模型留量**（见 mpc_nominal._sample_geom_spheres），
+    # 用来补球面采样/线性化误差 —— 与 arm_margin 的区别：margin 是「偏好」（代价里的目标距离），
+    # pad 是「模型」（把障碍物在几何上放大）。两者调大都更保守。
+    mpc_nominal_arm_pad: float = 0.01
+
+    # --- Stage2（2026-09-19）末端绕行路点标称层（global_planner='via_point'）---
+    # 动因：static3 的失败不是 D_SAFE 几何拒行，而是末端单积分器 MPC 没有「绕过去」的概念——
+    # 障碍封死直连时唯一能降代价的方向被堵死，于是停在原地（docs/数字真值表_20260910.md §7）。
+    # 做法：以 hover 为中心在末端空间撒候选网格，逐个 DLS IK + 两段关节插值窄相检验，
+    # 通过的候选再用 mj_geomDistance 精确余量打分取最优，作为 hover_override 交给内层 MPC。
+    #
+    # ⚠️ 关节空间 RRT（本模块的前身方案）已被实测否决，不要复活：
+    #    零余量最好调参 6 seed 只成功 2/6、平均 29.8 s/次；要求 ≥1 cm 余量几何不可行
+    #    （5 墙位 × 3 seed 只有 1/15，507 候选 3D 网格扫描 0 命中）。详见 docs 同节。
+    global_planner: str = "off"             # 'off' | 'via_point'（'off' 时逐位等同于纯 MPC）
+    via_step: float = 0.05                  # 候选网格间距 (m)，铺在 (lat_dir, path_dir) 平面内
+    via_grid: int = 6                       # 网格半宽：i,j ∈ [-via_grid, via_grid]（默认 13×13×3=507 个候选）
+    via_z_step: float = 0.06                # z 方向候选偏移 (m)，k ∈ {0, ±1}
+    via_edge_res: float = 0.01              # 两段关节插值分辨率 (rad)，用于窄相接触检验
+    via_ik_tol: float = 1.5e-3              # 候选点 IK 位置容差 (m)；超出即计一次 IK 失败
+    via_advance_tol: float = 0.03           # 末端距路点 < 此值 → 交回内层 hover，恢复 xy_align/下降 (m)
+    via_replan_steps: int = 25              # 重规划间隔（步）；静态障碍靠缓存，实际每集只筛一次
+    via_rescreen_tol: float = 0.01          # 障碍最大位移 > 此值才重新筛选 (m)
+    # ⚠️ 已作废（2026-09-20）：1 cm 余量目标经实测判定在本场景族**几何不可行**，
+    # 用户已决定取消该约束，目标改为「成功避障率尽量高」。
+    # 该键**至今从未被规划器使用**——只被读进 self.margin_target 后闲置；唯一的门控是
+    # _seg_min_gap(...) <= 0（不许穿透）。保留键只为兼容既有结果文件的 config 自描述，
+    # 不再作为任何筛选/排序依据，**不要**再拿它跟达成余量做比较。
+    via_margin_target: float = 0.01
+    via_score_points: int = 12              # 打分阶段每条两段路径的采样点数（mj_geomDistance 精确余量）
+    via_topk: int = 20                      # 粗排后进入精细打分的候选数（控制 mj_geomDistance 调用量）
 
     # --- D1 动态目标（L2 激活；L1 静止占位）---
     # 物体位置可 per-step 更新（运动学 qpos 写入，z 固定桌面高度 object_rest_z）
@@ -367,7 +442,26 @@ class TrainingConfig:
     ent_coef: float = 0.01          # 增加熵系数，促进探索
     vf_coef: float = 0.25
     max_grad_norm: float = 0.5
-    
+    # PPO 初始探索标准差 σ₀ = exp(log_std_init)（策略输出的是高斯分布，动作 = μ + σ·ε 采样）。
+    # None → 由 agent.py 按动作空间量程自动推导；显式给值则以此为准（微调时会覆盖 checkpoint 的 σ）。
+    #
+    # 【2026-09-15 更正】v27 把 residual 模式的动作空间归一化成 Box(-1,1) 之后，SB3 默认
+    # log_std_init=0.0 → σ₀=1.0 **终于是对的**（归一化动作的通用约定就是 O(1) 量级）。
+    # 在此之前，"残差恒满幅"的**主因不是 σ₀，而是 μ**：读 v25b2_gate checkpoint 的 action_net
+    # 权重实测 μ 中位 3.37/3.66/2.35（初始仅 0.0034，涨了 ~1000×）、σ=1.67/1.80/1.01、
+    # |μ|/σ 三轴恒 ≈2.0、P(|μ|>cap)=1.000 → 100% 饱和。只压 σ 无效：clip(3.4±0.001) 与
+    # clip(3.4±1.8) 同为 +0.002（已用 40k 实测验证，残差仍 0.116 m/s ≥ 满幅 0.0866）。
+    # 完整机理与修法见 environment.py::_setup_spaces 的注释。
+    # 因此本字段现在只作**手动覆盖**用，正常不用传。
+    log_std_init: Optional[float] = None
+
+    # v27：从旧 checkpoint 迁移进归一化动作空间时，是否重新初始化 action_net。
+    # 必要性：归一化改变了动作的**单位** —— 旧 checkpoint 的 μ≈3.4 是旧单位下的数，
+    # 直接搬进新空间会被 clip(a,±1) 压成 +1，残差仍恒等于 cap，等于没改。
+    # trunk（features_extractor/mlp_extractor）与 value_net 保留 → 迁移价值不丢。
+    # 只在"从 v27 之前的 checkpoint 迁移"时开一次；之后 resume v27 之后的 checkpoint 必须关掉。
+    reinit_action_head: bool = False
+
     # 归一化参数
     normalize_advantage: bool = True  # 优势函数归一化
     normalize_observations: bool = True  # 观察归一化

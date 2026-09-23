@@ -290,6 +290,63 @@ class GraspingAgent:
         logs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
         os.makedirs(logs_dir, exist_ok=True)
 
+        # ####################################################################
+        # 【2026-09-15 更正】下面这一整段（至 "修法：取 σ₀ = ..." 结束）是**上一版**的判断，
+        # 结论已被实测推翻，保留在此仅作推理痕迹。正确结论：
+        #   · "残差恒满幅"的**主因是 μ，不是 σ₀**。读 v25b2_gate 的 action_net 权重实测：
+        #     μ 中位 3.37/3.66/2.35（初始仅 0.0034，涨了 ~1000×）、σ=1.67/1.80/1.01、
+        #     |μ|/σ 三轴恒 ≈2.0、P(|μ|>cap)=1.000 → **100% 饱和**。
+        #   · 只压 σ 无效：clip(3.4±0.001) 与 clip(3.4±1.8) 同为 +0.002。已跑 40k 实测：
+        #     σ 强制 1.8→0.001，残差仍 0.116 m/s ≥ 满幅 0.0866，r_residual_step 仍每步 -1.0。
+        #   · 真正病因是**动作空间没归一化**：env 的 np.clip(±0.002) 让 |a|>0.002 区域
+        #     ∂执行动作/∂a ≡ 0 → 策略只看得见符号、看不见幅度 → 唯一可学方向变成"让 sign 稳定"
+        #     → 需要 |μ|/σ 大 → 而 ent_coef 在推 σ 往上 → 只能靠 μ 上涨兑现 → 双双失控。
+        #     修法在 environment.py::_setup_spaces（residual 模式动作空间改 Box(-1,1)）。
+        #   · 归一化之后 SB3 默认 σ₀=1.0 终于是对的：本段下面的自动推导会看到 _a_max=1.0，
+        #     走 else 分支取 0.0。所以这段逻辑现在退化为"可用的手动覆盖口子"，不是必需品。
+        # ####################################################################
+        #
+        # ---- PPO 初始探索尺度 log_std_init：把 σ₀ 对齐到动作的真实量程 ----
+        #
+        # 背景：PPO 的连续动作不是网络直接吐出一个数，而是**从一个高斯分布里采样**：
+        #     a = μ(s) + σ·ε,   ε ~ N(0, I)
+        # 网络（action_net）只负责 μ；σ 是一个独立的可学习参数，初始值 = exp(log_std_init)，
+        # 见 SB3 distributions.py：`log_std = nn.Parameter(ones(dim) * log_std_init)`。
+        #
+        # 问题：SB3 默认 log_std_init=0.0 → σ₀ = exp(0) = **1.0**。这个默认隐含假设
+        # "动作是 O(1) 量级"（Box(-1,1) 归一化动作是通用约定）。但本环境的动作不是归一化的：
+        #   · residual 模式：动作 = 末端位置增量，真正生效的量程只有 ±0.002 m/步
+        #     （residual_delta_cap；见 environment.py step 里的 _pos_cap）
+        #   · delta 模式：±max_ee_delta = ±0.005 m/步
+        # 于是默认 σ₀=1.0 比有效量程大 200~500 倍 → 噪声项 σ₀·ε 完全淹没 μ，
+        # 绝大多数采样落在 env 的 clip 边界之外。为什么这会让策略学不动：
+        #   1) clip 之外，奖励对动作是**平的**（动作再大，执行结果一样）→ 策略收不到
+        #      "你该往小走"的梯度。奖励只能告诉它"错了"，不能告诉它"错多少"。
+        #   2) 与此同时 ent_coef 那顶熵奖励**一直在把 σ 往大推**
+        #      （ent_coef>0 时 ∂loss/∂log_std < 0，梯度下降就往大的方向走）。
+        # 两边一夹：σ 下不来，动作恒饱和。日志里 `res ≡ 0.0866` 正是这个症状 ——
+        # √3 × 0.002 / 0.04 = 0.0866，即三个位置轴**同时**撞到 cap 的 box 角点，
+        # 这不是"残差恰好需要这么大"，而是尺度失配的必然结果。
+        #
+        # 修法：取 σ₀ = 动作量程上限 / 2（约 95% 的初始采样落在可用区间内，尾部仍能探到边界）。
+        # 起始偏小是安全方向：σ 可以由梯度**长大**（需要更多探索时），但从过大**缩小**很难
+        # —— 恰恰因为饱和区没有梯度。这一条与"残差奖励整形"无关，是纯粹的动作尺度对齐问题。
+        _log_std_init = getattr(self.training_config, 'log_std_init', None)
+        if _log_std_init is None:
+            _a_max = float(np.max(np.abs(np.asarray(vec_env.action_space.high, dtype=float))))
+            if _a_max < 1.0:
+                # 非归一化动作空间 → 按量程推导，别再吃 SB3 的 O(1) 默认值
+                _log_std_init = float(np.log(max(_a_max / 2.0, 1e-8)))
+                logger.info(
+                    f"log_std_init 未显式配置 → 按动作量程 ±{_a_max:g} 自动推导："
+                    f"σ₀={_a_max / 2.0:g}（log_std_init={_log_std_init:.4f}）。"
+                    f"（SB3 默认 0.0→σ₀=1.0 与量程失配 {1.0 / max(_a_max / 2.0, 1e-8):.0f}×，"
+                    f"会导致采样恒饱和、残差学不动）"
+                )
+            else:
+                _log_std_init = 0.0  # 动作本就是 O(1) 量级 → SB3 默认即合适
+                logger.info(f"log_std_init 未显式配置 → 动作量程 ±{_a_max:g} 属 O(1)，沿用 SB3 默认 σ₀=1.0")
+
         # 创建PPO智能体
         self.agent = PPO(
             "MlpPolicy",
@@ -311,7 +368,9 @@ class GraspingAgent:
                 "net_arch": {
                     "pi": self.network_config.policy_hidden_sizes,
                     "vf": self.network_config.value_hidden_sizes
-                }
+                },
+                # 关键修复：σ₀ 对齐动作真实量程（详见上方推导注释）
+                "log_std_init": _log_std_init,
             }
         )
 
@@ -328,9 +387,121 @@ class GraspingAgent:
             if os.path.exists(_norm_pkl):
                 _base = vec_env.venv if isinstance(vec_env, VecNormalize) else vec_env
                 vec_env = VecNormalize.load(_norm_pkl, _base)
+                # ################################################################
+                # 【2026-09-15 修复】动作空间被 pkl 静默改回旧量程
+                #
+                # VecNormalize.load 在 SB3 2.9 里的实现是：
+                #     vec_normalize = pickle.load(file)      # 反序列化**整个旧对象**
+                #     vec_normalize.set_venv(venv)
+                # 也就是 action_space / observation_space 全都跟着旧对象一起回来了；
+                # 而 set_venv 只做 check_shape_equal(obs) —— **不刷新 action_space**。
+                # 后果：只要 env 改了动作空间，pkl 里的旧量程就会把它悄悄改回去，
+                # 而 PPO.load 的动作空间校验发生在这之后 → 校验"通过"、全程不报错。
+                #
+                # 实测（v27_normact_40k 那次）：env 声明 Box(-1,1)，
+                # VecNormalize.load 之后变成 Box(±0.005)；策略按 ±0.005 采样、被 PPO
+                # 裁到 ±0.005，env 再乘 residual_delta_cap=0.002 → 残差恒 ≈1e-5 m/步
+                # （=预算 0.002 的 0.5%）→ "归一化动作空间"根本没生效，那一轮等于空跑。
+                #
+                # 修法：以当前 env 为唯一事实来源，pkl 只负责提供 obs 归一化统计。
+                # ################################################################
+                if vec_env.action_space != _base.action_space:
+                    logger.warning(
+                        f"⚠️ VecNormalize.load 把动作空间改回了 pkl 里的旧量程："
+                        f"{_base.action_space} → {vec_env.action_space}，已强制对齐回当前 env"
+                    )
+                vec_env.action_space = _base.action_space
+                vec_env.observation_space = _base.observation_space
                 logger.info(f"迁移学习：已恢复 VecNormalize 观测统计 {_norm_pkl}（venv={type(_base).__name__}）")
-            self.agent = PPO.load(self.model_path, env=vec_env)
-            logger.info(f"加载预训练模型: {self.model_path}")
+
+            # ####################################################################
+            # 【2026-09-15 修复】不再把 env 交给 PPO.load 做动作空间校验
+            #
+            # 两个坑叠在一起：
+            # 1) PPO.load 内部 `model.__dict__.update(data)` 会把 checkpoint 里存的
+            #    action_space 一起还原 —— 即使 env 声明的是 Box(-1,1)，模型仍按旧的
+            #    ±0.005 采样、并按 ±0.005 裁剪（PPO.collect_rollouts 里
+            #    np.clip(actions, self.action_space.low, self.action_space.high)）。
+            #    也就是说：**改动作空间但依赖 checkpoint 的 spaces，等于没改。**
+            # 2) check_for_correct_spaces 又要求两者一致，而 checkpoint 的量程本来
+            #    就该和新的不一样（这正是我们要换的东西）→ 带上 env 只会直接抛
+            #    "Action spaces do not match"。
+            #
+            # 所以改成：先 load（env=None），再显式把 spaces 对齐到当前 env，最后 set_env
+            # （set_env 内部还会再校验一次，此时两边已一致）。这是唯一能保证
+            # "env 说什么量程，策略就用什么量程"的顺序。
+            # ####################################################################
+            self.agent = PPO.load(self.model_path)
+            _ckpt_act = self.agent.action_space
+            self.agent.action_space = vec_env.action_space
+            self.agent.observation_space = vec_env.observation_space
+            self.agent.policy.action_space = vec_env.action_space
+            self.agent.policy.observation_space = vec_env.observation_space
+            if _ckpt_act != vec_env.action_space:
+                logger.warning(
+                    f"⚠️ checkpoint 的动作空间 {_ckpt_act} ≠ 当前 env 的 {vec_env.action_space}"
+                    f"（预期之内，说明动作量程确实换了）。已强制改为 env 的量程；"
+                    f"checkpoint 里像 μ 这样的**旧单位数值**需要配套处理，"
+                    f"否则会被 clip 到新量程边界（见 --reinit-action-head）。"
+                )
+            # 等价复刻 PPO.load(env=...) 里 env 分支该做的两件事：
+            #   data["n_envs"] = env.num_envs（issue #1018）与 data["_last_obs"] = None
+            #   （force_reset，issue #597）。set_env(force_reset=True) 负责后者。
+            if self.agent.n_envs != vec_env.num_envs:
+                logger.warning(f"n_envs 由 checkpoint 的 {self.agent.n_envs} 改为 {vec_env.num_envs}")
+                self.agent.n_envs = vec_env.num_envs
+            self.agent.set_env(vec_env)
+            logger.info(f"加载预训练模型: {self.model_path}（动作空间已对齐 {vec_env.action_space}）")
+
+            # ---- σ 重置 / 失配告警（迁移学习专用）----
+            # PPO.load 会把 checkpoint 里的 log_std **一起载入**，于是上面算出的 log_std_init
+            # 在微调路径上完全不生效 —— 而现有 checkpoint 的 σ 恰恰是被熵奖励一路吹大的
+            # （实测 v22→v26 收敛 σ：1.55 → 1.89，是有效动作量程 ±0.002 的 500~950 倍）。
+            # 不处理就等于把病一起继承过来，所以：
+            #   显式给了 log_std_init → 加载后强制覆盖 σ（这是微调路径下唯一生效的方式）
+            #   没给                  → 告警并报出 checkpoint 真实 σ，避免"以为改了其实没改"
+            _explicit_lsi = getattr(self.training_config, 'log_std_init', None)
+            if _explicit_lsi is not None:
+                with torch.no_grad():
+                    self.agent.policy.log_std.data.fill_(float(_explicit_lsi))
+                logger.info(
+                    f"σ 已强制重置为 {float(np.exp(_explicit_lsi)):g}"
+                    f"（log_std_init={float(_explicit_lsi):.4f}，覆盖 checkpoint 自带 log_std）"
+                )
+            else:
+                _sig_loaded = float(np.exp(self.agent.policy.log_std.data.mean()))
+                logger.warning(
+                    f"加载了预训练模型但未显式指定 log_std_init → σ 沿用 checkpoint 的 "
+                    f"{_sig_loaded:.4f}，自动推导值 {float(np.exp(_log_std_init)):g} 被覆盖、不生效。"
+                    f"若想强制对齐动作量程，请显式传 --log-std-init。"
+                )
+
+            # ---- 动作头重初始化（v27 归一化动作空间专用）----
+            # 归一化改变了动作的**单位**。旧 checkpoint 的 μ≈3.4 是"米"下的数，直接搬进
+            # Box(-1,1) 空间会被 clip(a,±1) 压成 +1 → 残差仍恒等于 cap、仍然饱和，等于没改。
+            # 所以从 v27 之前的 checkpoint 迁移时必须重init action_net；
+            # features_extractor / mlp_extractor / value_net 保留 → 迁移价值不丢。
+            if bool(getattr(self.training_config, 'reinit_action_head', False)):
+                _head = self.agent.policy.action_net
+                # 先量一下旧 μ 的量级（N(0,1) 观测代理：VecNormalize 会把 obs 标准化到 ~N(0,1)），
+                # 把"病"写进日志，便于和重训后的轨迹对照
+                with torch.no_grad():
+                    _probe = torch.randn(2048, self.agent.observation_space.shape[0])
+                    _latent = self.agent.policy.mlp_extractor.policy_net(
+                        self.agent.policy.extract_features(_probe, self.agent.policy.features_extractor))
+                    _mu_old = self.agent.policy.action_net(_latent).numpy()
+                _sat = float((np.abs(_mu_old) > 1.0).mean())  # 归一化空间的有效量程 = ±1
+                nn.init.orthogonal_(_head.weight, 0.01)
+                if _head.bias is not None:
+                    nn.init.constant_(_head.bias, 0.0)
+                logger.warning(
+                    f"action_net 已重新初始化（ortho gain=0.01, bias=0）。"
+                    f"重init前 μ 中位 {np.median(np.abs(_mu_old)):.3f}、"
+                    f"P(|μ|>1)={_sat:.3f}（归一化空间量程 ±1）—— 若不重init，"
+                    f"这些 μ 会被 clip 成 ±1、残差仍恒等于 cap。"
+                    f"trunk/value_net 保留。注意：只在从 v27 之前的 checkpoint 迁移时开一次，"
+                    f"resume v27 之后的 checkpoint 必须关掉 --reinit-action-head。"
+                )
 
         logger.info("智能体环境设置完成")
     
@@ -528,13 +699,40 @@ class GraspingAgent:
         # 恢复训练时的观测统计（若存在）
         vn_path = path.replace('.zip', '_vecnormalize.pkl')
         if os.path.exists(vn_path):
+            _live_act = vec_env.action_space
+            _live_obs = vec_env.observation_space
             vec_env = VecNormalize.load(vn_path, vec_env)
+            # 同 set_environment 里的修复（详见该处注释）：VecNormalize.load 是
+            # pickle.load 整个旧对象，会把 pkl 里的 action_space 一起带回来，而 set_venv
+            # 不刷新它 → 评估时动作量程被静默改回旧值，PPO.load 的校验也因此"通过"。
+            # 评估必须按 **当前 env 的量程** 解释策略输出，否则量级全错。
+            if vec_env.action_space != _live_act:
+                logger.warning(
+                    f"⚠️ 评估：VecNormalize.load 把动作空间改回了 pkl 旧量程 "
+                    f"{vec_env.action_space}（当前 env 是 {_live_act}），已强制对齐。"
+                    f"注意：v27 之前的 checkpoint 其 μ 是**旧单位**的数值，"
+                    f"在新量程下语义已经变了，不能和新 checkpoint 直接同口径比较。"
+                )
+            vec_env.action_space = _live_act
+            vec_env.observation_space = _live_obs
             logger.info(f"已恢复 VecNormalize 观测统计: {vn_path}")
         else:
             logger.warning(f"未找到 {vn_path}，观测统计将使用初始值（评估/部署可能失配）")
 
-        self.agent = PPO.load(path, env=vec_env)
-        logger.info(f"模型已从 {path} 加载")
+        # 同 set_environment：不把 env 交给 PPO.load 做空间校验（checkpoint 的 spaces
+        # 会经 model.__dict__.update(data) 覆盖 env 的），改为 load → 对齐 spaces → set_env。
+        self.agent = PPO.load(path)
+        _ckpt_act = self.agent.action_space
+        self.agent.action_space = vec_env.action_space
+        self.agent.observation_space = vec_env.observation_space
+        self.agent.policy.action_space = vec_env.action_space
+        self.agent.policy.observation_space = vec_env.observation_space
+        if _ckpt_act != vec_env.action_space:
+            logger.warning(f"评估：checkpoint 动作空间 {_ckpt_act} ≠ env {vec_env.action_space}，已对齐到 env")
+        if self.agent.n_envs != vec_env.num_envs:
+            self.agent.n_envs = vec_env.num_envs
+        self.agent.set_env(vec_env)
+        logger.info(f"模型已从 {path} 加载（动作空间 {vec_env.action_space}）")
     
     def get_policy(self):
         """获取策略网络"""

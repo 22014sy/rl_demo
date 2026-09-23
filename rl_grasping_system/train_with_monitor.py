@@ -8,6 +8,7 @@
 import os
 import sys
 import copy
+import math
 import argparse
 import logging
 
@@ -66,6 +67,23 @@ def main():
     parser.add_argument('--ctrl-delay-max', type=int, default=-1,
                         help='模型失配域随机化：每 episode 随机执行延迟 U[0, N] 决策步（>-1 开启；'
                              '训练残差补偿 plant 执行延迟/模型误差）。默认关闭=原行为')
+    # 动作尺度对齐（2026-09-15）：PPO 动作是从高斯采样 a = μ + σ·ε，σ 初始值 = exp(log_std_init)。
+    # SB3 默认 log_std_init=0.0 → σ=1.0，隐含假设动作是 O(1) 量级。
+    # 【更正】v27 把 residual 动作空间归一化成 Box(-1,1) 后，这个默认**终于是对的**。
+    # 此前"残差恒满幅"的主因是 μ（实测 3.37/3.66/2.35，初始 0.0034），不是 σ₀ —— 只压 σ 无效。
+    parser.add_argument('--log-std-init', type=float, default=None,
+                        help='PPO 探索尺度 σ 的 log 值（σ = exp(该值)）。不传 → 从零训练时按动作量程'
+                             '自动推导；微调（--load-model）时 PPO.load 会带入 checkpoint 的 log_std，'
+                             '自动值被覆盖而**不生效**。显式传值 → 加载后强制重置 σ。'
+                             'v27 归一化后正常不用传（σ₀=1.0 即为正确默认）')
+    # v27 归一化动作空间迁移开关（2026-09-15）：见 config.TrainingConfig.reinit_action_head
+    parser.add_argument('--reinit-action-head', action='store_true',
+                        help='加载 --load-model 后重新初始化 action_net（ortho gain=0.01, bias=0）。'
+                             'v27 把 residual 动作空间改成 Box(-1,1) 后，旧 checkpoint 的 μ≈3.4 是'
+                             '旧单位下的数，搬进新空间会被 clip 成 ±1、残差仍恒等于 cap —— '
+                             '所以从 v27 之前的 checkpoint 迁移必须开这个开关一次。'
+                             'trunk/value_net 保留，迁移价值不丢。'
+                             '**resume v27 之后的 checkpoint 时必须关掉**，否则抹掉已学到的策略。')
     parser.add_argument('--dynamic-target', action='store_true',
                         help='D1 动态目标（L2）：物体 per-step 沿 target_motion_axis 往返运动')
     parser.add_argument('--target-vel', type=float, default=0.0,
@@ -104,7 +122,16 @@ def main():
                         help='v25 残差激活判定阈值 m/s（覆盖 config.reward.residual_step_threshold；默认 0.02）')
     parser.add_argument('--residual-delta-cap', type=float, default=None,
                         help='v25 残差预算解耦：residual 分支每决策步位置增量上限 m（覆盖 config.grasping.residual_delta_cap；'
-                             '0.002→v_max_res=0.05 m/s = MPC v_max 40%；None 用默认 0.002）')
+                             # 注意：argparse 会把 help 当 %-format 处理，字面量 % 必须写 %%，
+                             # 否则 `%；` 会被判为非法格式符 → 整个 --help 直接抛 ValueError 崩掉
+                             '0.002→v_max_res=0.05 m/s = MPC v_max 40%%；None 用默认 0.002）')
+    parser.add_argument('--residual-clip-mode', type=str, default='',
+                        help='残差裁剪几何（覆盖 config.grasping.residual_clip_mode；默认 modulus=不改）。'
+                             'modulus=HEAD/v25+ 语义（动作层 a∈[-1,1]×cap，再对 ‖Δv‖ 做模长裁剪）。'
+                             'per_axis=pre-gating/cadd00e 语义（动作空间回米制 ±max_ee_delta，逐轴裁剪）。'
+                             '⚠️ 只在 residual 模式生效，且**改变了动作空间声明**——用 per_axis 训练出的 '
+                             'checkpoint 自带米制动作空间，评测时也必须配 --residual-clip-mode per_axis，'
+                             '否则口径失配（§9.3 实测差 33pp 以上）。')
     parser.add_argument('--residual-collision-threshold', type=float, default=None,
                         help='v25 残差碰撞双倍罚判定阈值 m/s（覆盖 config.reward.residual_collision_threshold；默认 0.02）')
     parser.add_argument('--residual-collision-penalty-extra', type=float, default=None,
@@ -235,6 +262,8 @@ def main():
             config.reward.residual_step_threshold = args.residual_step_threshold
         if args.residual_delta_cap is not None:
             config.grasping.residual_delta_cap = args.residual_delta_cap
+        if args.residual_clip_mode:
+            config.grasping.residual_clip_mode = args.residual_clip_mode
         if args.residual_collision_threshold is not None:
             config.reward.residual_collision_threshold = args.residual_collision_threshold
         if args.residual_collision_penalty_extra is not None:
@@ -303,6 +332,19 @@ def main():
         n_envs = max(1, int(config.system.num_envs))
         if args.total_timesteps > 0:
             config.training.total_timesteps = int(args.total_timesteps)
+        # 动作尺度对齐（2026-09-15）：显式传值 → 覆盖。微调路径下 agent.py 会据此强制重置 σ
+        # （PPO.load 会带入 checkpoint 的 log_std，不重置则本参数不生效）。
+        if args.log_std_init is not None:
+            config.training.log_std_init = float(args.log_std_init)
+            logger.info(
+                f"🎯 log_std_init = {args.log_std_init:.4f} → σ = {math.exp(args.log_std_init):g}"
+                f"（若 --load-model，加载后会覆盖 checkpoint 自带 log_std）"
+            )
+        # v27：从旧 checkpoint 迁移进归一化动作空间 → 重init action_net（详见 --reinit-action-head）
+        if args.reinit_action_head:
+            config.training.reinit_action_head = True
+            logger.warning("🔧 reinit-action-head：加载后会重新初始化 action_net"
+                           "（旧 μ≈3.4 在 Box(-1,1) 下会被 clip 成 ±1，不重init 等于没改）")
         total_timesteps = config.training.total_timesteps
         logger.info(f"配置加载完成：n_envs={n_envs}, total_timesteps={total_timesteps}, "
                     f"action_space_dim={config.grasping.action_space_dim}, "

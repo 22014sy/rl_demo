@@ -183,11 +183,19 @@ def make_nominal_trajectory(cfg):
       'velocity_field' → 本文件速度场替身（假 MoveIt，无状态 O(1)，训练快）
       'mpc'            → mpc_nominal.MpcNominal（末端级滚动最优控制，自带障碍避障软约束）
     两者接口一致（reference_velocity → 6 维 twist），观测槽位/环境 step 零改动。
+
+    Stage2（2026-09-19）再加一层正交开关 `global_planner`：
+      'via_point' → ViaPointNominal（内层仍是 MpcNominal，外面套「绕行路点」选点层）。
+      默认 'off' → 逐位等同改造前（回归护栏）。
     """
     if str(getattr(cfg, "action_mode", "delta")).lower() != "residual":
         return None
     mode = str(getattr(cfg, "nominal_mode", "velocity_field")).lower()
     if mode == "mpc":
+        planner = str(getattr(cfg, "global_planner", "off")).lower()
+        if planner == "via_point":
+            from via_point_nominal import ViaPointNominal
+            return ViaPointNominal(cfg)
         from mpc_nominal import MpcNominal
         return MpcNominal(cfg)
     return NominalTrajectory(cfg)
